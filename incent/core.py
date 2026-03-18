@@ -214,83 +214,204 @@ def find_mnn_anchors(M_bio, k=15):
     return anchors
 
 
-def ransac_rigid_transform(coords_A, coords_B, anchors, n_iter=500, inlier_thresh=None):
+def canonical_coords(coords):
     """
-    Fit a 2D rigid transform x_B ≈ R*x_A + t using RANSAC over anchor pairs.
-    Returns R, t, and inlier indices into the anchor list.
+    Canonicalize coordinates with centroid/scale normalization and PCA orientation.
     """
-    from scipy.linalg import svd
+    from scipy.spatial.distance import pdist
+    from sklearn.decomposition import PCA
 
-    if len(anchors) < 2:
-        return np.eye(2), np.zeros(2), np.array([], dtype=int)
+    center = coords.mean(axis=0)
+    coords_c = coords - center
+
+    if len(coords_c) > 2000:
+        idx = np.random.choice(len(coords_c), 2000, replace=False)
+        sample = coords_c[idx]
+    else:
+        sample = coords_c
+
+    dists = pdist(sample)
+    scale = np.percentile(dists, 95) if len(dists) > 0 else 1.0
+    if scale == 0:
+        scale = 1.0
+    coords_cs = coords_c / scale
+
+    pca = PCA(n_components=2)
+    pca.fit(coords_cs)
+    coords_norm = pca.transform(coords_cs)
+
+    if np.median(coords_norm[:, 0]) < 0:
+        coords_norm[:, 0] *= -1
+    if np.median(coords_norm[:, 1]) < 0:
+        coords_norm[:, 1] *= -1
+
+    return coords_norm, center, scale, pca
+
+
+def apply_canonical(coords, center, scale, pca):
+    """Apply canonical transform to points."""
+    return pca.transform((coords - center) / scale)
+
+
+def invert_canonical(coords_norm, center, scale, pca):
+    """Invert canonical transform back to original frame."""
+    return pca.inverse_transform(coords_norm) * scale + center
+
+
+def disambiguate_reflection(coords_A_norm, coords_B_norm, nd_A, nd_B):
+    """
+    Resolve bilateral reflection ambiguity using population-level niche fingerprints.
+    """
+    from scipy.spatial.distance import jensenshannon
+    from sklearn.neighbors import BallTree
+
+    mu_A = nd_A.mean(axis=0)
+    mu_A = mu_A / (mu_A.sum() + 1e-12)
+
+    flips = [(1, 1), (-1, 1), (1, -1), (-1, -1)]
+    best_jsd = np.inf
+    best_flip = (1, 1)
+
+    tree_B = BallTree(coords_B_norm)
+    radius = 0.3
+
+    for fx, fy in flips:
+        reflected = coords_A_norm * np.array([fx, fy])
+        centroid_A = reflected.mean(axis=0)
+        idx_near = tree_B.query_radius([centroid_A], r=radius)[0]
+
+        if len(idx_near) < 10:
+            idx_near = tree_B.query_radius([centroid_A], r=radius * 2)[0]
+        if len(idx_near) < 5:
+            continue
+
+        mu_B_local = nd_B[idx_near].mean(axis=0)
+        mu_B_local = mu_B_local / (mu_B_local.sum() + 1e-12)
+
+        mu_A_s = mu_A + 1e-6
+        mu_B_s = mu_B_local + 1e-6
+        mu_A_s /= mu_A_s.sum()
+        mu_B_s /= mu_B_s.sum()
+
+        jsd = jensenshannon(mu_A_s, mu_B_s)
+        if jsd < best_jsd:
+            best_jsd = jsd
+            best_flip = (fx, fy)
+
+    coords_A_reflected = coords_A_norm * np.array(best_flip)
+    return best_flip, coords_A_reflected
+
+
+def ransac_translation(coords_A, coords_B, anchors, n_iter=1000, inlier_thresh=0.05):
+    """
+    Fit translation-only transform in normalized canonical space.
+    """
+    if len(anchors) == 0:
+        return np.zeros(2), np.array([], dtype=int), 0.0
 
     pts_A = np.array([coords_A[i] for i, _ in anchors], dtype=np.float64)
     pts_B = np.array([coords_B[j] for _, j in anchors], dtype=np.float64)
+    translations = pts_B - pts_A
 
-    if inlier_thresh is None:
-        from sklearn.neighbors import NearestNeighbors
-        nn = NearestNeighbors(n_neighbors=2).fit(coords_B)
-        dists, _ = nn.kneighbors(coords_B)
-        inlier_thresh = 5.0 * np.median(dists[:, 1])
-
-    def fit_rigid(pA, pB):
-        cA, cB = pA.mean(0), pB.mean(0)
-        H = (pA - cA).T @ (pB - cB)
-        U, _, Vt = svd(H)
-        R = Vt.T @ U.T
-        if np.linalg.det(R) < 0:
-            Vt[-1, :] *= -1
-            R = Vt.T @ U.T
-        t = cB - R @ cA
-        return R, t
-
+    best_t = np.zeros(2)
     best_inliers = np.array([], dtype=int)
-    best_R, best_t = None, None
 
-    n_iter = int(max(1, n_iter))
-    for _ in range(n_iter):
-        idx = np.random.choice(len(anchors), size=2, replace=False)
-        R, t = fit_rigid(pts_A[idx], pts_B[idx])
-        residuals = np.linalg.norm(pts_B - (pts_A @ R.T + t), axis=1)
+    for _ in range(max(1, int(n_iter))):
+        idx = np.random.randint(len(anchors))
+        t_candidate = translations[idx]
+        residuals = np.linalg.norm(translations - t_candidate, axis=1)
         inliers = np.where(residuals < inlier_thresh)[0]
-
         if len(inliers) > len(best_inliers):
             best_inliers = inliers
-            if len(inliers) >= 2:
-                best_R, best_t = fit_rigid(pts_A[inliers], pts_B[inliers])
+            best_t = translations[inliers].mean(axis=0)
 
-    if best_R is None:
-        best_R, best_t = fit_rigid(pts_A, pts_B)
-        best_inliers = np.arange(len(anchors))
-
-    return best_R, best_t, best_inliers
+    inlier_fraction = len(best_inliers) / max(len(anchors), 1)
+    return best_t, best_inliers, inlier_fraction
 
 
-def spatial_deviation_cost(coords_A, coords_B, R, t, sigma=None):
+def spatial_deviation_cost(coords_A_registered, coords_B_norm, sigma=None):
     """
-    Spatial deviation matrix M_dev(i,j) = ||x_B_j - (R*x_A_i + t)||^2 / sigma^2.
+    Spatial deviation in the common canonical frame.
     """
-    T_coords_A = coords_A @ R.T + t
-    diff = T_coords_A[:, None, :] - coords_B[None, :, :]
+    diff = coords_A_registered[:, None, :] - coords_B_norm[None, :, :]
     sq_dist = np.sum(diff ** 2, axis=2)
 
     if sigma is None:
-        nz = sq_dist[sq_dist > 0]
-        sigma = np.sqrt(np.median(nz)) if nz.size else 1.0
+        min_dists = sq_dist.min(axis=1)
+        sigma_sq = np.median(min_dists)
+        sigma_sq = max(sigma_sq, 1e-6)
+    else:
+        sigma_sq = sigma ** 2
 
-    return sq_dist / (sigma ** 2 + 1e-8)
+    return sq_dist / sigma_sq
 
 
-def refine_transform_from_plan(pi, coords_A, coords_B, n_top=500):
+def preregister(sliceA, sliceB, nd_A, nd_B, M_bio, k_mnn=15, n_ransac=1000, verbose=False):
     """
-    Re-estimate rigid transform from top-confidence transport pairs.
+    Canonicalize both slices, resolve reflection, and perform MNN+RANSAC translation.
     """
-    from scipy.linalg import svd
+    coords_A_raw = sliceA.obsm['spatial'].copy().astype(float)
+    coords_B_raw = sliceB.obsm['spatial'].copy().astype(float)
 
+    coords_A_norm, cA, sA, pcaA = canonical_coords(coords_A_raw)
+    coords_B_norm, cB, sB, pcaB = canonical_coords(coords_B_raw)
+
+    if verbose:
+        print(f"[P1+P2] A centroid: {cA}, scale: {sA:.2f}")
+        print(f"[P1+P2] B centroid: {cB}, scale: {sB:.2f}")
+
+    best_flip, coords_A_reflected = disambiguate_reflection(coords_A_norm, coords_B_norm, nd_A, nd_B)
+    if verbose:
+        print(f"[P3] Best reflection: {best_flip}")
+
+    anchors = find_mnn_anchors(M_bio, k=k_mnn)
+    if verbose:
+        print(f"[P4] MNN anchors: {len(anchors)}")
+
+    if len(anchors) >= 4:
+        t_fine, inliers, inlier_frac = ransac_translation(
+            coords_A_reflected,
+            coords_B_norm,
+            anchors,
+            n_iter=n_ransac,
+            inlier_thresh=0.05,
+        )
+        if verbose:
+            print(f"[P4] RANSAC: {len(inliers)}/{len(anchors)} inliers ({inlier_frac:.1%}), t={t_fine}")
+    else:
+        t_fine = np.zeros(2)
+        inlier_frac = 0.0
+        inliers = np.array([], dtype=int)
+        if verbose:
+            print("[P4] Too few anchors, skipping fine registration.")
+
+    coords_A_reg = coords_A_reflected + t_fine
+
+    reg_info = {
+        'cA': cA,
+        'sA': sA,
+        'pcaA': pcaA,
+        'cB': cB,
+        'sB': sB,
+        'pcaB': pcaB,
+        'best_flip': best_flip,
+        't_fine': t_fine,
+        'inliers': inliers,
+        'inlier_fraction': inlier_frac,
+        'anchors': anchors,
+    }
+
+    return coords_A_reg, coords_B_norm, reg_info
+
+
+def refine_translation_from_plan(pi, coords_A_registered, coords_B_norm, n_top=500):
+    """
+    Re-estimate translation from the current transport plan using top pairs.
+    """
     pi = np.asarray(pi, dtype=np.float64)
     flat = pi.ravel()
     if flat.size == 0:
-        return np.eye(2), np.zeros(2)
+        return np.zeros(2)
 
     n_top = int(max(2, min(n_top, flat.size)))
     top_idx = np.argpartition(flat, -n_top)[-n_top:]
@@ -299,23 +420,14 @@ def refine_transform_from_plan(pi, coords_A, coords_B, n_top=500):
     weights = flat[top_idx]
     w_sum = np.sum(weights)
     if w_sum <= 0:
-        return np.eye(2), np.zeros(2)
+        return np.zeros(2)
 
-    pA = coords_A[rows]
-    pB = coords_B[cols]
+    pA = coords_A_registered[rows]
+    pB = coords_B_norm[cols]
     w = weights / w_sum
 
-    cA = np.sum(w[:, None] * pA, axis=0)
-    cB = np.sum(w[:, None] * pB, axis=0)
-    H = (pA - cA).T @ np.diag(w) @ (pB - cB)
-    U, _, Vt = svd(H)
-    R = Vt.T @ U.T
-    if np.linalg.det(R) < 0:
-        Vt[-1, :] *= -1
-        R = Vt.T @ U.T
-    t = cB - R @ cA
-
-    return R, t
+    t_delta = np.sum(w[:, None] * (pB - pA), axis=0)
+    return t_delta
 
 
 def pairwise_align(
@@ -324,25 +436,10 @@ def pairwise_align(
     alpha: float,
     beta: float,
     gamma: float,
-    delta: float,
     radius: float,
     filePath: str,
-    use_rep: Optional[str] = None, 
-    G_init = None, 
-    a_distribution = None, 
-    b_distribution = None, 
-    norm: bool = False, 
-    numItermax: int = 6000, 
-    backend = ot.backend.TorchBackend(), 
-    use_gpu: bool = False, 
-    return_obj: bool = False,
-    verbose: bool = False, 
-    gpu_verbose: bool = True, 
-    sliceA_name: Optional[str] = None,
-    sliceB_name: Optional[str] = None,
-    overwrite = False,
-    neighborhood_dissimilarity: str='jsd',
-    **kwargs) -> Union[NDArray[np.floating], Tuple[NDArray[np.floating], float, float, float, float]]:
+    alpha_dev: float = 0.4,
+    **kwargs) -> Tuple[NDArray[np.floating], NDArray[np.floating], NDArray[np.floating], dict]:
     """
 
     This method is written by Anup Bhowmik, CSE, BUET
@@ -380,6 +477,18 @@ def pairwise_align(
         
         - Objective function output of cost 
     """
+
+    # Backward-compatible optional controls are read from kwargs.
+    delta = float(kwargs.get('delta', 0.0))
+    use_rep = kwargs.get('use_rep', None)
+    backend = kwargs.get('backend', ot.backend.TorchBackend())
+    use_gpu = bool(kwargs.get('use_gpu', False))
+    verbose = bool(kwargs.get('verbose', False))
+    gpu_verbose = bool(kwargs.get('gpu_verbose', True))
+    sliceA_name = kwargs.get('sliceA_name', None)
+    sliceB_name = kwargs.get('sliceB_name', None)
+    overwrite = bool(kwargs.get('overwrite', False))
+    neighborhood_dissimilarity = kwargs.get('neighborhood_dissimilarity', 'jsd')
 
     start_time = time.time()
 
@@ -663,80 +772,70 @@ def pairwise_align(
             return x.detach().cpu().numpy()
         return np.asarray(x)
 
-    # Run OT (BIOT): MNN anchors -> RANSAC rigid init -> EM with linear OT
-    coords_A_np = np.asarray(sliceA.obsm['spatial'].copy(), dtype=np.float64)
-    coords_B_np = np.asarray(sliceB.obsm['spatial'].copy(), dtype=np.float64)
+    # Combined biological cost (numpy, no spatial term yet)
+    M_bio_np = ((1.0 - beta) * _to_np(cosine_dist_gene_expr)
+                + beta * M_celltype
+                + gamma * _to_np(M2))
 
-    M1_np = _to_np(M1).astype(np.float64)
-    M2_np = _to_np(M2).astype(np.float64)
-    M_bio = M1_np + gamma * M2_np
-
-    a_np = _to_np(a).astype(np.float64)
-    b_np = _to_np(b).astype(np.float64)
-    a_np = np.clip(a_np, 0.0, None)
-    b_np = np.clip(b_np, 0.0, None)
-    a_np = a_np / (np.sum(a_np) + 1e-12)
-    b_np = b_np / (np.sum(b_np) + 1e-12)
-
+    # Pre-registration
     k_mnn = int(kwargs.get('k_mnn', 15))
-    n_ransac = int(kwargs.get('n_ransac', 500))
-    em_iters = int(kwargs.get('em_iters', 5))
-    alpha_dev = float(kwargs.get('alpha_dev', alpha))
-    alpha_dev = float(np.clip(alpha_dev, 0.0, 1.0))
+    n_ransac = int(kwargs.get('n_ransac', 1000))
+    coords_A_reg, coords_B_norm, reg_info = preregister(
+        sliceA,
+        sliceB,
+        nd_A,
+        nd_B,
+        M_bio_np,
+        k_mnn=k_mnn,
+        n_ransac=n_ransac,
+        verbose=verbose,
+    )
 
-    anchors = find_mnn_anchors(M_bio, k=k_mnn)
-    logFile.write(f"MNN anchors found: {len(anchors)}\n")
+    logFile.write(f"Reflection: {reg_info['best_flip']}\n")
+    logFile.write(f"Fine translation: {reg_info['t_fine']}\n")
+    logFile.write(f"RANSAC inlier fraction: {reg_info['inlier_fraction']:.3f}\n")
 
-    if len(anchors) < 6:
-        logFile.write("Warning: too few MNN anchors, using biological OT only\n")
-        pi = ot.emd(a_np, b_np, M_bio.astype(np.float64))
-    else:
-        R, t, inliers = ransac_rigid_transform(coords_A_np, coords_B_np, anchors, n_iter=n_ransac)
-        logFile.write(f"RANSAC inliers: {len(inliers)}/{len(anchors)}\n")
-        logFile.write(f"Translation t: {t}\n")
+    # Spatial deviation cost and adaptive spatial weighting
+    M_dev = spatial_deviation_cost(coords_A_reg, coords_B_norm)
+    alpha_dev_eff = float(alpha_dev) * min(1.0, float(reg_info['inlier_fraction']) / 0.4)
+    logFile.write(f"Effective alpha_dev: {alpha_dev_eff:.3f}\n")
 
-        inlier_fraction = len(inliers) / max(len(anchors), 1)
-        if inlier_fraction < 0.3:
-            # Weak geometric consensus: avoid forcing a potentially wrong spatial transform.
-            logFile.write("Low RANSAC confidence: slice A near midline, using biological OT only\n")
-            pi = ot.emd(a_np, b_np, M_bio.astype(np.float64))
-        else:
-            if inlier_fraction < 0.5:
-                alpha_dev_adjusted = alpha_dev * (inlier_fraction / 0.5)
-                logFile.write(
-                    f"Moderate RANSAC confidence: inlier_fraction={inlier_fraction:.4f}, "
-                    f"alpha_dev adjusted {alpha_dev:.4f} -> {alpha_dev_adjusted:.4f}\n"
-                )
-            else:
-                alpha_dev_adjusted = alpha_dev
+    M_total = (1.0 - alpha_dev_eff) * M_bio_np + alpha_dev_eff * M_dev
 
-            bio_scale = np.percentile(M_bio, 95)
-            if not np.isfinite(bio_scale) or bio_scale <= 0:
-                bio_scale = np.max(M_bio) + 1e-8
-            M_bio_norm = M_bio / (bio_scale + 1e-8)
+    # Standard linear OT with uniform marginals
+    a = np.ones(sliceA.shape[0], dtype=np.float64) / sliceA.shape[0]
+    b = np.ones(sliceB.shape[0], dtype=np.float64) / sliceB.shape[0]
+    pi = ot.emd(a, b, M_total.astype(np.float64))
 
-            pi = None
-            for em_iter in range(max(1, em_iters)):
-                M_dev = spatial_deviation_cost(coords_A_np, coords_B_np, R, t)
-                dev_scale = np.percentile(M_dev, 95)
-                if not np.isfinite(dev_scale) or dev_scale <= 0:
-                    dev_scale = np.max(M_dev) + 1e-8
-                M_dev_norm = M_dev / (dev_scale + 1e-8)
+    # EM refinement (translation only)
+    for em_iter in range(3):
+        top_n = min(500, pi.size)
+        flat = pi.flatten()
+        flat_idx = np.argsort(flat)[-top_n:]
+        rows = flat_idx // pi.shape[1]
+        cols = flat_idx % pi.shape[1]
+        w = flat[flat_idx]
 
-                M_total = (1.0 - alpha_dev_adjusted) * M_bio_norm + alpha_dev_adjusted * M_dev_norm
-                pi = ot.emd(a_np, b_np, M_total.astype(np.float64))
+        if np.sum(w) <= 0:
+            break
 
-                R_new, t_new = refine_transform_from_plan(pi, coords_A_np, coords_B_np, n_top=min(500, pi.size))
-                t_change = np.linalg.norm(t_new - t)
-                R_change = np.linalg.norm(R_new - R, ord='fro')
-                logFile.write(f"EM iter {em_iter}: |Dt|={t_change:.6f}, |DR|={R_change:.6f}\n")
+        w = w / np.sum(w)
+        pA = coords_A_reg[rows]
+        pB = coords_B_norm[cols]
+        t_new = np.sum(w[:, None] * (pB - pA), axis=0)
 
-                R, t = R_new, t_new
-                if t_change < 1.0 and R_change < 1e-3:
-                    break
+        t_change = np.linalg.norm(t_new - reg_info['t_fine'])
+        coords_A_reg = coords_A_reg + t_new - reg_info['t_fine']
+        reg_info['t_fine'] = t_new
 
-            if pi is None:
-                pi = ot.emd(a_np, b_np, M_bio.astype(np.float64))
+        logFile.write(f"EM iter {em_iter}: |Dt|={t_change:.5f}\n")
+
+        M_dev = spatial_deviation_cost(coords_A_reg, coords_B_norm)
+        M_total = (1.0 - alpha_dev_eff) * M_bio_np + alpha_dev_eff * M_dev
+        pi = ot.emd(a, b, M_total.astype(np.float64))
+
+        if t_change < 1e-3:
+            break
 
     G_np = np.ones((a.shape[0], b.shape[0]), dtype=np.float64) / (a.shape[0] * b.shape[0])
 
@@ -800,6 +899,12 @@ def pairwise_align(
 
     logFile.write(f"Final objective gene expr(cosine_dist): {final_obj_gene}\n")
     # print(f"Final objective (cosine_dist): {final_obj_gene}\n")
+
+    # Surface objective diagnostics to caller while keeping the new BIOT return signature.
+    reg_info['initial_obj_neighbor'] = float(initial_obj_neighbor)
+    reg_info['initial_obj_gene_cos'] = float(initial_obj_gene)
+    reg_info['final_obj_neighbor'] = float(final_obj_neighbor)
+    reg_info['final_obj_gene_cos'] = float(final_obj_gene)
     
 
     logFile.write(f"Runtime: {str(time.time() - start_time)} seconds\n")
@@ -813,10 +918,28 @@ def pairwise_align(
     if isinstance(backend,ot.backend.TorchBackend) and use_gpu:
         torch.cuda.empty_cache()
 
-    if return_obj:
-        return pi, initial_obj_neighbor, initial_obj_gene, final_obj_neighbor, final_obj_gene
-    
-    return pi
+    if kwargs.get('visualize', False):
+        visualize_alignment(
+            pi,
+            sliceA,
+            sliceB,
+            coords_A_reg,
+            coords_B_norm,
+            reg_info,
+            top_k=int(kwargs.get('visualize_top_k', 200)),
+            output_path=kwargs.get('visualize_output_path', None),
+        )
+
+    if kwargs.get('visualize_on_B', False):
+        visualize_alignment_on_B(
+            pi,
+            sliceA,
+            sliceB,
+            coords_A_reg,
+            coords_B_norm,
+        )
+
+    return pi, coords_A_reg, coords_B_norm, reg_info
 
 
 def neighborhood_distribution(curr_slice, radius):
@@ -896,3 +1019,86 @@ def cosine_distance(sliceA, sliceB, sliceA_name, sliceB_name, filePath, use_rep 
             np.save(fileName, cosine_dist_gene_expr)
 
     return cosine_dist_gene_expr
+
+
+def visualize_alignment(pi, sliceA, sliceB, coords_A_reg, coords_B_norm,
+                         reg_info, top_k=200, output_path=None):
+    """
+    Correct alignment visualization:
+    - Plot slice B cells at coords_B_norm (canonical frame)
+    - Plot slice A cells at coords_A_reg  (registered into B's frame)
+    - Draw correspondence lines for top-k highest-weight pi pairs
+    """
+    import matplotlib.pyplot as plt
+    import matplotlib.lines as mlines
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+    # ── Left panel: raw coordinates (shows the pre-registration problem) ──
+    ax = axes[0]
+    raw_A = sliceA.obsm['spatial']
+    raw_B = sliceB.obsm['spatial']
+    ax.scatter(raw_A[:, 0], raw_A[:, 1], s=2, c='#534AB7', alpha=0.4, label='Slice A (raw)')
+    ax.scatter(raw_B[:, 0], raw_B[:, 1], s=2, c='#1D9E75', alpha=0.4, label='Slice B (raw)')
+    ax.set_title('Before pre-registration (raw coords)', fontsize=11)
+    ax.legend(markerscale=4, fontsize=9)
+    ax.set_aspect('equal')
+
+    # ── Right panel: registered coordinates with correspondence lines ──
+    ax = axes[1]
+    ax.scatter(coords_B_norm[:, 0], coords_B_norm[:, 1],
+               s=2, c='#1D9E75', alpha=0.3, label='Slice B')
+    ax.scatter(coords_A_reg[:, 0], coords_A_reg[:, 1],
+               s=2, c='#534AB7', alpha=0.6, label='Slice A (registered)')
+
+    # Draw top-k correspondence lines
+    flat = pi.flatten()
+    top_idx = np.argsort(flat)[-top_k:]
+    for idx in top_idx:
+        i = idx // pi.shape[1]
+        j = idx %  pi.shape[1]
+        weight = flat[idx]
+        ax.plot([coords_A_reg[i, 0], coords_B_norm[j, 0]],
+                [coords_A_reg[i, 1], coords_B_norm[j, 1]],
+                'k-', alpha=min(weight * pi.shape[0] * pi.shape[1] * 0.3, 0.8),
+                linewidth=0.5)
+
+    ax.set_title('After pre-registration (canonical frame)', fontsize=11)
+    ax.legend(markerscale=4, fontsize=9)
+    ax.set_aspect('equal')
+
+    plt.tight_layout()
+    if output_path:
+        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.show()
+
+
+def visualize_alignment_on_B(pi, sliceA, sliceB, coords_A_reg, coords_B_norm):
+    """
+    Alternative: show only the registered frame.
+    Color cells by their matched partner's cell type — confirms anatomical correctness.
+    """
+    import matplotlib.pyplot as plt
+    import matplotlib.cm as cm
+
+    # For each A cell, find its top matched B cell
+    matched_B = np.argmax(pi, axis=1)   # (n_A,)
+
+    # Color A cells by the cell type of their match in B
+    ctypes_B = np.array(sliceB.obs['cell_type_annot'].values)
+    unique_ct = np.unique(ctypes_B)
+    ct_to_idx = {c: i for i, c in enumerate(unique_ct)}
+    colors = np.array([ct_to_idx[ctypes_B[j]] for j in matched_B])
+
+    fig, ax = plt.subplots(figsize=(8, 7))
+    ax.scatter(coords_B_norm[:, 0], coords_B_norm[:, 1],
+               s=3, c='lightgray', alpha=0.2, label='Slice B (background)')
+    sc = ax.scatter(coords_A_reg[:, 0], coords_A_reg[:, 1],
+                    s=4, c=colors, cmap='tab20', alpha=0.8,
+                    label='Slice A (colored by matched B cell type)')
+    ax.set_title('Alignment quality: A cells colored by matched B cell type')
+    ax.set_aspect('equal')
+    plt.tight_layout()
+    plt.show()
+
+    

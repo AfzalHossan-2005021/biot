@@ -1,1 +1,1 @@
-from .incent import pairwise_align, neighborhood_distribution, cosine_distance
+from .incent import pairwise_align, neighborhood_distribution, cosine_distance, visualize_alignment, visualize_alignment_on_B

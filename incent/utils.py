@@ -57,7 +57,7 @@ def jensenshannon_distance_1_vs_many_backend(X, Y):
     M   = (X + Y) / 2.0
     kl1 = torch.from_numpy(kl_divergence_corresponding_backend(X, M))
     kl2 = torch.from_numpy(kl_divergence_corresponding_backend(Y, M))
-    return nx.sqrt((kl1 + kl2) / 2.0).T[0]
+    return nx.sqrt((kl1 + kl2) / 2.0).squeeze()
 
 
 def jensenshannon_divergence_backend(X, Y):

@@ -132,7 +132,6 @@ def pairwise_align(
     G_init                    = None,
     a_distribution            = None,
     b_distribution            = None,
-    norm:      bool           = False,
     numItermax: int           = 6000,
     backend                   = ot.backend.NumpyBackend(),
     use_gpu:   bool           = False,
@@ -233,8 +232,10 @@ def pairwise_align(
     D_B = ot.dist(coordsB, coordsB, metric='euclidean')
 
     # Normalize each distance matrix by its own minimum non-zero value
-    D_A = D_A / nx.min(D_A > 0)
-    D_B = D_B / nx.min(D_B > 0)
+    min_nonzero_A = nx.min(D_A[D_A > 0])
+    min_nonzero_B = nx.min(D_B[D_B > 0])
+    D_A = D_A / min_nonzero_A
+    D_B = D_B / min_nonzero_B
 
     # Get max for logging
     scale_A = float(nx.max(D_A))

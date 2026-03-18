@@ -1,1105 +1,739 @@
-import os
-import ot
-import time
-import torch
-import datetime
+"""
+sff_incent.py  —  SFF-INCENT: Spatial Frequency Fingerprinting for MERFISH alignment
+=======================================================================================
+Drop-in replacement for pairwise_align().
+
+Key design decisions:
+  1. No GW, no FGW, no raw-coordinate distance matrices.
+  2. Registration is solved first, at population level, via image registration.
+  3. Cell matching is solved second, locally, using biology.
+  4. General: works for any organ, any number of regions, any symmetry.
+"""
+
+import os, time, datetime
 import numpy as np
-import pandas as pd
-
-from tqdm import tqdm
-from anndata import AnnData
-from numpy.typing import NDArray
-from typing import Optional, Tuple, Union
-
-from .utils import to_dense_array, extract_data_matrix, jensenshannon_divergence_backend, pairwise_msd
+from scipy.fft          import fft2, ifft2, fftshift
+from scipy.ndimage      import gaussian_filter, rotate as ndrotate, zoom as ndzoom, map_coordinates
+from sklearn.neighbors  import BallTree
+from sklearn.metrics.pairwise import cosine_distances
+from scipy.spatial.distance   import jensenshannon
 
 
-def identify_target_hemisphere(sliceA, sliceB, nd_A, nd_B, threshold=0.05):
+# ═══════════════════════════════════════════════════════════════════════════════
+# Module 1 — Density map construction
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def build_density_map(coords, cell_types, grid_size=128, sigma_px=4):
     """
-    Determine which spatial half of sliceB the cells of sliceA best match,
-    using population-level niche fingerprint comparison.
-    Returns: 'left', 'right', or 'both' (if no clear signal).
+    Convert a cell point cloud into a multi-channel 2D KDE density image.
+
+    Parameters
+    ----------
+    coords     : (n, 2) float   raw spatial coordinates (any scale/frame)
+    cell_types : (n,)   str     cell type label per cell
+    grid_size  : int            resolution H=W of the output grid
+    sigma_px   : float          Gaussian KDE bandwidth in grid pixels
+
+    Returns
+    -------
+    img     : (K, H, W) float32    K = number of unique cell types
+    ct_names: (K,)      ndarray    cell type names (channel labels)
+    affine  : dict                 maps grid pixels ↔ original coords
+                                   keys: mn, max_span, scale, offset_x, offset_y
     """
-    coords_B = sliceB.obsm['spatial']
-    
-    # Step 1: Find the bilateral symmetry axis of B
-    # PCA on spatial coordinates: PC1 = longest axis = left-right axis
-    from sklearn.decomposition import PCA
-    pca = PCA(n_components=2)
-    pca.fit(coords_B)
-    pc1_scores = pca.transform(coords_B)[:, 0]
-    midline = np.median(pc1_scores)  # Midline = median along PC1
-    
-    # Step 2: Split B into two halves
-    left_mask  = pc1_scores <= midline
-    right_mask = pc1_scores >  midline
-    
-    # Step 3: Population-level niche fingerprints
-    # Average over all cells — integrates out individual cell noise
-    mu_A     = nd_A.mean(axis=0)
-    mu_B_L   = nd_B[left_mask].mean(axis=0)
-    mu_B_R   = nd_B[right_mask].mean(axis=0)
-    
-    # Normalize to probability distributions
-    mu_A   = mu_A   / mu_A.sum()
-    mu_B_L = mu_B_L / mu_B_L.sum()
-    mu_B_R = mu_B_R / mu_B_R.sum()
-    
-    # Step 4: JSD comparison at population level
-    from scipy.spatial.distance import jensenshannon
-    jsd_left  = jensenshannon(mu_A, mu_B_L)
-    jsd_right = jensenshannon(mu_A, mu_B_R)
-    
-    # Step 5: Decision with uncertainty band
-    ratio = abs(jsd_left - jsd_right) / (jsd_left + jsd_right + 1e-12)
-    if ratio < threshold:
-        return 'both', left_mask, right_mask, pc1_scores, midline
-    elif jsd_left < jsd_right:
-        return 'left', left_mask, right_mask, pc1_scores, midline
-    else:
-        return 'right', left_mask, right_mask, pc1_scores, midline
+    ct_names = np.unique(cell_types)
+    K = len(ct_names)
+    ct_idx = {c: i for i, c in enumerate(ct_names)}
+
+    mn   = coords.min(axis=0)
+    span = coords.max(axis=0) - mn
+    max_span = span.max()
+    if max_span < 1e-9:
+        max_span = 1.0
+
+    # Keep aspect ratio: fit longest axis to (grid_size - 2*margin) pixels
+    margin = 4
+    scale = (grid_size - 2 * margin) / max_span
+    # Center the tissue inside the grid
+    offset = margin + (grid_size - 2*margin - span * scale) / 2.0
+
+    affine = dict(mn=mn, max_span=max_span, scale=scale,
+                  offset=offset, grid_size=grid_size)
+
+    img = np.zeros((K, grid_size, grid_size), dtype=np.float32)
+    for i in range(len(coords)):
+        # Map physical coord → grid pixel
+        gx = int(np.clip(round((coords[i, 0] - mn[0]) * scale + offset[0]),
+                         0, grid_size - 1))
+        gy = int(np.clip(round((coords[i, 1] - mn[1]) * scale + offset[1]),
+                         0, grid_size - 1))
+        img[ct_idx[cell_types[i]], gy, gx] += 1.0
+
+    for k in range(K):
+        img[k] = gaussian_filter(img[k].astype(np.float64),
+                                 sigma=sigma_px).astype(np.float32)
+    return img, ct_names, affine
 
 
-def hemisphere_aware_G0(sliceA, sliceB, hemisphere, left_mask, right_mask):
+def grid_to_phys(gx, gy, affine):
+    """Convert grid pixel coordinates back to physical coordinates."""
+    x = (gx - affine['offset'][0]) / affine['scale'] + affine['mn'][0]
+    y = (gy - affine['offset'][1]) / affine['scale'] + affine['mn'][1]
+    return x, y
+
+
+def phys_to_grid(coords, affine):
+    """Convert physical coordinates to grid pixel coordinates."""
+    gx = (coords[:, 0] - affine['mn'][0]) * affine['scale'] + affine['offset'][0]
+    gy = (coords[:, 1] - affine['mn'][1]) * affine['scale'] + affine['offset'][1]
+    return np.stack([gx, gy], axis=1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Module 2 — Phase correlation primitives
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _phase_corr_2d(FA, FB):
     """
-    Build an asymmetric initialization G0 that concentrates transport mass
-    onto the identified target hemisphere of B.
-    High weight on target hemisphere cells, near-zero on other hemisphere.
+    Normalized cross-power spectrum between two FFTs.
+    Returns the real-part IFFT (phase correlation map), fftshift-centered.
+    Peak location gives the integer pixel shift.
     """
-    n_A = sliceA.shape[0]
-    n_B = sliceB.shape[0]
-    
-    G0 = np.ones((n_A, n_B)) / (n_A * n_B)
-    
-    if hemisphere == 'left':
-        # Amplify target hemisphere, suppress other
-        G0[:, left_mask]  *= 10.0
-        G0[:, right_mask] *= 0.01
-    elif hemisphere == 'right':
-        G0[:, right_mask] *= 10.0
-        G0[:, left_mask]  *= 0.01
-    # 'both': uniform initialization unchanged
-    
-    # Renormalize to valid transport plan
-    G0 /= G0.sum()
-    return G0
+    cross = np.conj(FA) * FB
+    denom = np.abs(cross) + 1e-12
+    return np.real(ifft2(cross / denom))
 
 
-def spatial_coherence_cost(sliceB, pc1_scores, midline, hemisphere, lambda_coh=0.5):
+def phase_correlate_multichannel(imgA, imgB, weights=None):
     """
-    Returns M_coh: (n_B,) cost vector — penalty for each B cell being
-    on the wrong side of the midline given the identified hemisphere.
-    Applied as an additive term to M1: M1 += lambda_coh * M_coh[None, :]
-    Broadcasting means all cells in A share the same lateral penalty for each B cell.
+    Multi-channel phase correlation.
+
+    imgA, imgB : (K, H, W) float arrays (same K, H, W)
+    weights    : (K,) channel weights; default = sqrt of signal product
+
+    Returns
+    -------
+    tx, ty    : integer pixel offsets  (B = shifted version of A by (tx, ty))
+    peak_val  : float   confidence (higher = better)
+    corr_map  : (H, W)  full correlation map for diagnostics
     """
-    if hemisphere == 'both':
-        return np.zeros(sliceB.shape[0])
-    
-    # Soft penalty: sigmoid of signed distance from midline,
-    # pointing toward the wrong hemisphere
-    signed_dist = pc1_scores - midline  # positive = right half
-    
-    if hemisphere == 'left':
-        # Penalize cells in B that are on the right side
-        # Penalty increases with distance from midline into wrong territory
-        M_coh = np.maximum(0, signed_dist)  # 0 on left, positive on right
-    else:  # 'right'
-        M_coh = np.maximum(0, -signed_dist) # 0 on right, positive on left
-    
-    # Normalize to [0,1]
-    if M_coh.max() > 0:
-        M_coh /= M_coh.max()
-    
-    return M_coh  # shape (n_B,) — broadcast over all cells in A
+    K, H, W = imgA.shape
+    corr_acc = np.zeros((H, W), dtype=np.float64)
 
-# ── NEW: Phase 1 ─────────────────────────────────────────────────────────────
-def joint_anatomical_embedding(nd_A, nd_B, sigma=None, n_components=15):
+    for k in range(K):
+        FA = fft2(imgA[k].astype(np.float64))
+        FB = fft2(imgB[k].astype(np.float64))
+        w  = float(np.sqrt(imgA[k].sum() * imgB[k].sum()) + 1e-12) \
+             if weights is None else float(weights[k])
+        corr_acc += w * _phase_corr_2d(FA, FB)
+
+    corr_map  = fftshift(corr_acc)
+    fy, fx    = np.unravel_index(np.argmax(corr_map), corr_map.shape)
+    peak_val  = corr_map[fy, fx]
+
+    # Convert fftshift-centered indices to signed offsets
+    ty = fy - H // 2
+    tx = fx - W // 2
+
+    return int(tx), int(ty), float(peak_val), corr_map
+
+
+def _log_polar(mag, num_angles=360, num_radii=None):
     """
-    Joint diffusion map on neighborhood distributions of two slices.
-    Returns cluster labels for all n_A + n_B cells.
-    sigma=None → estimated as median pairwise JSD (bandwidth heuristic).
+    Log-polar transform of a magnitude spectrum image (already fftshifted).
+    Used for Fourier-Mellin rotation/scale estimation.
     """
-    from sklearn.neighbors import BallTree
-    import scipy.sparse as sp
-    from sklearn.cluster import KMeans
+    H, W     = mag.shape
+    num_radii = num_radii or (min(H, W) // 2)
+    cy, cx   = H / 2.0, W / 2.0
+    max_r    = min(cx, cy) * 0.7   # avoid wrap-around
 
-    X = np.vstack([nd_A, nd_B])         # (n_A+n_B) x K
-    n = X.shape[0]
+    theta = np.linspace(0, np.pi, num_angles, endpoint=False)
+    log_r = np.linspace(0, np.log(max_r + 1e-9), num_radii)
+    r     = np.exp(log_r)
 
-    # Pairwise JSD — reuse jensenshannon_divergence_backend
-    D = jensenshannon_divergence_backend(X, X)   # (n x n) full matrix
+    R, Th = np.meshgrid(r, theta, indexing='ij')     # (num_radii, num_angles)
+    xs    = cx + R * np.cos(Th)
+    ys    = cy + R * np.sin(Th)
 
-    if sigma is None:
-        sigma = np.median(D[D > 0])
-
-    K = np.exp(-D**2 / sigma**2)
-    # Row-normalize to Markov matrix
-    row_sums = K.sum(axis=1, keepdims=True)
-    P = K / row_sums
-
-    # Top eigenvectors (diffusion coordinates)
-    from scipy.sparse.linalg import eigs
-    vals, vecs = eigs(P, k=n_components+1, which='LM')
-    vals, vecs = vals[1:].real, vecs[:, 1:].real   # drop trivial component
-    Phi = vecs * vals[np.newaxis, :]               # scale by eigenvalues
-
-    # Leiden clustering on diffusion coordinates
-    # (use leidenalg if available, else fall back to KMeans)
-    try:
-        import leidenalg, igraph
-        import sklearn.neighbors
-        knn = sklearn.neighbors.NearestNeighbors(n_neighbors=15).fit(Phi)
-        adj = knn.kneighbors_graph(mode='connectivity')
-        g = igraph.Graph.Adjacency(adj.toarray().tolist())
-        partition = leidenalg.find_partition(g, leidenalg.ModularityVertexPartition)
-        labels = np.array(partition.membership)
-    except ImportError:
-        from sklearn.cluster import KMeans
-        labels = KMeans(n_clusters=20, n_init=10).fit_predict(Phi)
-
-    return labels, Phi
+    return map_coordinates(mag, [ys.ravel(), xs.ravel()],
+                           order=1, mode='constant', cval=0.0
+                           ).reshape(num_radii, num_angles).astype(np.float32)
 
 
-# ── NEW: Phase 2 ─────────────────────────────────────────────────────────────
-def adaptive_marginals(labels, n_A, n_B, eps=0.05):
+def fourier_mellin_rotation_scale(imgA_sum, imgB_sum, num_angles=360):
     """
-    Given cluster labels for all n_A+n_B cells,
-    return adaptive uniform marginals a (n_A,) and b (n_B,)
-    where only cells in shared clusters have nonzero weight.
+    Estimate rotation and scale between two single-channel images via
+    Fourier-Mellin (log-polar phase correlation on magnitude spectra).
+
+    Returns
+    -------
+    angle_deg   : float  rotation of A relative to B (degrees)
+    scale_ratio : float  scale of A relative to B
+    confidence  : float
     """
-    labels_A = labels[:n_A]
-    labels_B = labels[n_A:]
+    H, W    = imgA_sum.shape
+    window  = np.outer(np.hanning(H), np.hanning(W))
 
-    clusters = np.unique(labels)
-    shared_clusters = set()
-    for r in clusters:
-        frac_A = np.sum(labels_A == r) / max(np.sum(labels == r), 1)
-        if eps < frac_A < 1 - eps:
-            shared_clusters.add(r)
+    FA_mag  = np.abs(fftshift(fft2(imgA_sum * window))) + 1e-12
+    FB_mag  = np.abs(fftshift(fft2(imgB_sum * window))) + 1e-12
 
-    mask_A = np.array([labels_A[i] in shared_clusters for i in range(n_A)], dtype=float)
-    mask_B = np.array([labels_B[j] in shared_clusters for j in range(n_B)], dtype=float)
+    lpA     = _log_polar(FA_mag, num_angles=num_angles)
+    lpB     = _log_polar(FB_mag, num_angles=num_angles)
 
-    if mask_A.sum() == 0 or mask_B.sum() == 0:
-        # Fallback: no shared clusters found → use uniform (full overlap assumed)
-        return np.ones(n_A)/n_A, np.ones(n_B)/n_B, set()
+    # Phase correlate: tx → log-radial (scale), ty → angular (rotation)
+    tx, ty, conf, _ = phase_correlate_multichannel(
+        lpA[None], lpB[None], weights=None)
 
-    a = mask_A / mask_A.sum()
-    b = mask_B / mask_B.sum()
-    return a, b, shared_clusters
+    num_radii = lpA.shape[0]
+    max_r     = np.log(min(H, W) / 2 * 0.7 + 1e-9)
+    scale_ratio = float(np.exp(tx * max_r / max(num_radii, 1)))
+    angle_deg   = float(ty * 180.0 / num_angles)
 
-
-# ── MODIFIED: cluster coherence cost ─────────────────────────────────────────
-def cluster_coherence_cost(labels_A, labels_B):
-    """Binary mismatch matrix: 0 if same cluster, 1 otherwise."""
-    return (labels_A[:, None] != labels_B[None, :]).astype(np.float64)
+    return angle_deg, scale_ratio, conf
 
 
-def find_mnn_anchors(M_bio, k=15):
+# ═══════════════════════════════════════════════════════════════════════════════
+# Module 3 — Image-space transform helpers
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def apply_rotation_stack(img, angle_deg):
+    """Rotate (K,H,W) stack by angle_deg (degrees), keeping image size."""
+    K = img.shape[0]
+    out = np.zeros_like(img)
+    for k in range(K):
+        out[k] = ndrotate(img[k], angle=angle_deg, reshape=False,
+                          mode='constant', cval=0.0)
+    return out
+
+
+def apply_scale_stack(img, scale_ratio):
+    """Scale (K,H,W) stack by scale_ratio, centred, output same H×W."""
+    if abs(scale_ratio - 1.0) < 0.005:
+        return img.copy()
+    K, H, W = img.shape
+    out = np.zeros_like(img)
+    for k in range(K):
+        z = ndzoom(img[k], scale_ratio, order=1)
+        sh, sw = z.shape
+        if sh >= H and sw >= W:
+            y0 = (sh - H) // 2; x0 = (sw - W) // 2
+            out[k] = z[y0:y0+H, x0:x0+W]
+        else:
+            y0 = (H - sh) // 2; x0 = (W - sw) // 2
+            out[k, y0:y0+sh, x0:x0+sw] = z
+    return out
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Module 4 — Full transform search over 4 reflections
+# ═══════════════════════════════════════════════════════════════════════════════
+
+REFLECTIONS = [(1, 1), (-1, 1), (1, -1), (-1, -1)]
+
+
+def find_transform(sliceA, sliceB, grid_size=128, sigma_px=4,
+                   num_angles=360, verbose=True):
     """
-    Discover mutual nearest-neighbor anchors between A and B from a
-    biological cost matrix M_bio (lower is better).
+    Find the full rigid transform (reflection, rotation, scale, translation)
+    that registers sliceA into sliceB's coordinate frame.
+
+    Uses multi-channel cell-type density maps + Fourier-Mellin transform.
+    No biological cost matrices used here — pure spatial frequency matching.
+
+    Returns
+    -------
+    best      : dict   all transform parameters + confidence
+    coords_A_reg : (n_A, 2)  A's coords in B's physical frame
+    coords_B     : (n_B, 2)  B's coords (unchanged)
     """
-    M_bio = np.asarray(M_bio, dtype=np.float64)
-    k = int(max(1, min(k, M_bio.shape[0], M_bio.shape[1])))
+    ct_A   = np.array(sliceA.obs['cell_type_annot'].astype(str))
+    ct_B   = np.array(sliceB.obs['cell_type_annot'].astype(str))
+    cA_raw = sliceA.obsm['spatial'].copy().astype(float)
+    cB_raw = sliceB.obsm['spatial'].copy().astype(float)
 
-    nn_A_to_B = np.argsort(M_bio, axis=1)[:, :k]
-    nn_B_to_A = np.argsort(M_bio, axis=0)[:k, :].T
+    # Build B density map once (reference frame)
+    imgB, ct_B_names, affB = build_density_map(
+        cB_raw, ct_B, grid_size=grid_size, sigma_px=sigma_px)
+    imgB_sum = imgB.sum(axis=0)
 
-    anchors = []
-    for i in range(M_bio.shape[0]):
-        for j in nn_A_to_B[i]:
-            if i in nn_B_to_A[j]:
-                anchors.append((i, int(j)))
-    return anchors
+    best = dict(confidence=-np.inf)
+
+    for flip_x, flip_y in REFLECTIONS:
+        cA_flip = cA_raw * np.array([flip_x, flip_y])
+
+        imgA, ct_A_names, affA = build_density_map(
+            cA_flip, ct_A, grid_size=grid_size, sigma_px=sigma_px)
+        imgA_sum = imgA.sum(axis=0)
+
+        # Shared cell types
+        shared_ct = sorted(set(ct_A_names) & set(ct_B_names))
+        if not shared_ct:
+            continue
+        idxA = [np.where(ct_A_names == c)[0][0] for c in shared_ct]
+        idxB = [np.where(ct_B_names == c)[0][0] for c in shared_ct]
+        imgA_sh = imgA[idxA]
+        imgB_sh = imgB[idxB]
+
+        # Step 1: Fourier-Mellin → rotation + scale
+        angle, scale, rs_conf = fourier_mellin_rotation_scale(
+            imgA_sum, imgB_sum, num_angles=num_angles)
+
+        # Fourier-Mellin has a 180° ambiguity — test both
+        for angle_candidate in [angle, angle + 180.0]:
+            # Apply rotation and scale to A's density map
+            imgA_rs = apply_rotation_stack(imgA_sh, angle_candidate)
+            imgA_rs = apply_scale_stack(imgA_rs, scale)
+
+            # Step 2: Phase correlation → translation
+            tx, ty, peak_val, corr_map = phase_correlate_multichannel(
+                imgA_rs, imgB_sh)
+
+            if verbose:
+                print(f"  flip=({flip_x:+d},{flip_y:+d})  "
+                      f"angle={angle_candidate:+7.1f}°  "
+                      f"scale={scale:.3f}  "
+                      f"tx={tx:+4d}  ty={ty:+4d}  "
+                      f"peak={peak_val:.4f}")
+
+            if peak_val > best['confidence']:
+                best = dict(
+                    flip=(flip_x, flip_y),
+                    angle=angle_candidate,
+                    scale=scale,
+                    tx_px=tx, ty_px=ty,
+                    confidence=peak_val,
+                    affA=affA, affB=affB,
+                )
+
+    if best['confidence'] == -np.inf:
+        raise RuntimeError("SFF registration failed: no shared cell types found.")
+
+    if verbose:
+        print(f"\n>>> Best: flip={best['flip']}  "
+              f"angle={best['angle']:.1f}°  scale={best['scale']:.3f}  "
+              f"tx={best['tx_px']}  ty={best['ty_px']}  "
+              f"conf={best['confidence']:.4f}\n")
+
+    coords_A_reg = _apply_transform_to_coords(cA_raw, best)
+    return best, coords_A_reg, cB_raw.copy()
 
 
-def canonical_coords(coords):
+def _apply_transform_to_coords(coords_A_raw, transform):
     """
-    Canonicalize coordinates with centroid/scale normalization and PCA orientation.
+    Apply the discovered image-space transform to physical cell coordinates.
+
+    The forward transform in grid space is:
+        1. Reflect:   cA_flip  = cA * (flip_x, flip_y)
+        2. To grid A: g = (cA_flip - mn_A) * scale_A + offset_A
+        3. Rotate:    g_rot = R(angle) @ (g - center) + center
+        4. Scale:     g_sc  = (g_rot - center) * scale_ratio + center
+        5. Translate: g_t   = g_sc + (tx_px, ty_px)
+        6. To phys B: cB    = (g_t - offset_B) / scale_B + mn_B
     """
-    from scipy.spatial.distance import pdist
-    from sklearn.decomposition import PCA
+    flip_x, flip_y   = transform['flip']
+    angle_rad        = np.deg2rad(transform['angle'])
+    scale_ratio      = transform['scale']
+    tx, ty           = transform['tx_px'], transform['ty_px']
+    affA             = transform['affA']
+    affB             = transform['affB']
+    G                = affA['grid_size']
+    cx = cy          = G / 2.0
 
-    center = coords.mean(axis=0)
-    coords_c = coords - center
+    cos_a, sin_a = np.cos(angle_rad), np.sin(angle_rad)
+    R = np.array([[cos_a, -sin_a],
+                  [sin_a,  cos_a]])
 
-    if len(coords_c) > 2000:
-        idx = np.random.choice(len(coords_c), 2000, replace=False)
-        sample = coords_c[idx]
-    else:
-        sample = coords_c
+    # Step 1: reflect
+    cA = coords_A_raw * np.array([flip_x, flip_y])
 
-    dists = pdist(sample)
-    scale = np.percentile(dists, 95) if len(dists) > 0 else 1.0
-    if scale == 0:
-        scale = 1.0
-    coords_cs = coords_c / scale
+    # Step 2: to grid-A pixels
+    gA = ((cA - affA['mn']) * affA['scale']
+          + affA['offset'])                       # (n,2) in [0, G-1]
 
-    pca = PCA(n_components=2)
-    pca.fit(coords_cs)
-    coords_norm = pca.transform(coords_cs)
+    # Step 3: rotate around grid centre
+    gA_c     = gA - np.array([cx, cy])
+    gA_rot   = gA_c @ R.T + np.array([cx, cy])   # R.T because coords are row vectors
 
-    if np.median(coords_norm[:, 0]) < 0:
-        coords_norm[:, 0] *= -1
-    if np.median(coords_norm[:, 1]) < 0:
-        coords_norm[:, 1] *= -1
+    # Step 4: scale around grid centre
+    gA_sc    = (gA_rot - np.array([cx, cy])) * scale_ratio + np.array([cx, cy])
 
-    return coords_norm, center, scale, pca
+    # Step 5: translate
+    gA_t     = gA_sc + np.array([tx, ty])
 
-
-def apply_canonical(coords, center, scale, pca):
-    """Apply canonical transform to points."""
-    return pca.transform((coords - center) / scale)
-
-
-def invert_canonical(coords_norm, center, scale, pca):
-    """Invert canonical transform back to original frame."""
-    return pca.inverse_transform(coords_norm) * scale + center
+    # Step 6: to B physical coords
+    coords_A_reg = (gA_t - affB['offset']) / affB['scale'] + affB['mn']
+    return coords_A_reg
 
 
-def disambiguate_reflection(coords_A_norm, coords_B_norm, nd_A, nd_B):
+# ═══════════════════════════════════════════════════════════════════════════════
+# Module 5 — Overlap detection + local biological matching
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def estimate_search_radius(coords_B, percentile=75):
     """
-    Resolve bilateral reflection ambiguity using population-level niche fingerprints.
+    Estimate a good search radius from B's cell density.
+    Use the `percentile`-th nearest-neighbor distance × 3.
+    Gives a radius that typically contains 5–15 cells.
     """
-    from scipy.spatial.distance import jensenshannon
-    from sklearn.neighbors import BallTree
+    tree = BallTree(coords_B)
+    dists, _ = tree.query(coords_B, k=2)     # k=2: first is self (dist=0)
+    nn_dists = dists[:, 1]
+    return float(np.percentile(nn_dists, percentile) * 3.0)
 
-    mu_A = nd_A.mean(axis=0)
-    mu_A = mu_A / (mu_A.sum() + 1e-12)
 
-    flips = [(1, 1), (-1, 1), (1, -1), (-1, -1)]
-    best_jsd = np.inf
-    best_flip = (1, 1)
+def local_biological_matching(sliceA, sliceB,
+                               coords_A_reg, coords_B,
+                               nd_A, nd_B,
+                               cosine_dist_AB,
+                               gamma=0.5,
+                               search_radius=None,
+                               soft_temp=0.5,
+                               verbose=True):
+    """
+    Match each cell i in A to cells in B within a spatial radius,
+    using a biological cost = (1-gamma)*cosine_gene + gamma*JSD_niche.
 
-    tree_B = BallTree(coords_B_norm)
-    radius = 0.3
+    Non-overlapping cells (no B neighbors within radius) are left unmatched.
 
-    for fx, fy in flips:
-        reflected = coords_A_norm * np.array([fx, fy])
-        centroid_A = reflected.mean(axis=0)
-        idx_near = tree_B.query_radius([centroid_A], r=radius)[0]
+    soft_temp : softmax temperature (as fraction of local cost range).
+                0 → hard argmin,  1 → fully soft.  Default 0.5 works well.
 
-        if len(idx_near) < 10:
-            idx_near = tree_B.query_radius([centroid_A], r=radius * 2)[0]
-        if len(idx_near) < 5:
+    Returns
+    -------
+    pi          : (n_A, n_B) float32   transport plan (rows sum to 1/n_A for matched cells)
+    unmatched   : list[int]            indices of A cells with no B neighbor in radius
+    """
+    n_A, n_B = sliceA.shape[0], sliceB.shape[0]
+
+    if search_radius is None:
+        search_radius = estimate_search_radius(coords_B)
+        if verbose:
+            print(f"  Auto search radius: {search_radius:.2f} (same units as coords_B)")
+
+    tree_B = BallTree(coords_B)
+    pi     = np.zeros((n_A, n_B), dtype=np.float32)
+    unmatched = []
+
+    for i in range(n_A):
+        cands = tree_B.query_radius([coords_A_reg[i]], r=search_radius)[0]
+
+        if len(cands) == 0:
+            unmatched.append(i)
             continue
 
-        mu_B_local = nd_B[idx_near].mean(axis=0)
-        mu_B_local = mu_B_local / (mu_B_local.sum() + 1e-12)
+        # Biological cost for cell i vs each candidate j
+        bio = np.array([
+            (1.0 - gamma) * float(cosine_dist_AB[i, j])
+            + gamma * float(jensenshannon(nd_A[i] + 1e-9, nd_B[j] + 1e-9))
+            for j in cands
+        ])
 
-        mu_A_s = mu_A + 1e-6
-        mu_B_s = mu_B_local + 1e-6
-        mu_A_s /= mu_A_s.sum()
-        mu_B_s /= mu_B_s.sum()
+        # Soft assignment via temperature-scaled softmax
+        span = bio.max() - bio.min() + 1e-12
+        tau  = soft_temp * span + 1e-12
+        logw = -bio / tau
+        logw -= logw.max()
+        w    = np.exp(logw)
+        w   /= w.sum()
 
-        jsd = jensenshannon(mu_A_s, mu_B_s)
-        if jsd < best_jsd:
-            best_jsd = jsd
-            best_flip = (fx, fy)
-
-    coords_A_reflected = coords_A_norm * np.array(best_flip)
-    return best_flip, coords_A_reflected
-
-
-def ransac_translation(coords_A, coords_B, anchors, n_iter=1000, inlier_thresh=0.05):
-    """
-    Fit translation-only transform in normalized canonical space.
-    """
-    if len(anchors) == 0:
-        return np.zeros(2), np.array([], dtype=int), 0.0
-
-    pts_A = np.array([coords_A[i] for i, _ in anchors], dtype=np.float64)
-    pts_B = np.array([coords_B[j] for _, j in anchors], dtype=np.float64)
-    translations = pts_B - pts_A
-
-    best_t = np.zeros(2)
-    best_inliers = np.array([], dtype=int)
-
-    for _ in range(max(1, int(n_iter))):
-        idx = np.random.randint(len(anchors))
-        t_candidate = translations[idx]
-        residuals = np.linalg.norm(translations - t_candidate, axis=1)
-        inliers = np.where(residuals < inlier_thresh)[0]
-        if len(inliers) > len(best_inliers):
-            best_inliers = inliers
-            best_t = translations[inliers].mean(axis=0)
-
-    inlier_fraction = len(best_inliers) / max(len(anchors), 1)
-    return best_t, best_inliers, inlier_fraction
-
-
-def spatial_deviation_cost(coords_A_registered, coords_B_norm, sigma=None):
-    """
-    Spatial deviation in the common canonical frame.
-    """
-    diff = coords_A_registered[:, None, :] - coords_B_norm[None, :, :]
-    sq_dist = np.sum(diff ** 2, axis=2)
-
-    if sigma is None:
-        min_dists = sq_dist.min(axis=1)
-        sigma_sq = np.median(min_dists)
-        sigma_sq = max(sigma_sq, 1e-6)
-    else:
-        sigma_sq = sigma ** 2
-
-    return sq_dist / sigma_sq
-
-
-def preregister(sliceA, sliceB, nd_A, nd_B, M_bio, k_mnn=15, n_ransac=1000, verbose=False):
-    """
-    Canonicalize both slices, resolve reflection, and perform MNN+RANSAC translation.
-    """
-    coords_A_raw = sliceA.obsm['spatial'].copy().astype(float)
-    coords_B_raw = sliceB.obsm['spatial'].copy().astype(float)
-
-    coords_A_norm, cA, sA, pcaA = canonical_coords(coords_A_raw)
-    coords_B_norm, cB, sB, pcaB = canonical_coords(coords_B_raw)
+        for m, j in enumerate(cands):
+            pi[i, j] = float(w[m]) / n_A     # normalise by n_A for global plan
 
     if verbose:
-        print(f"[P1+P2] A centroid: {cA}, scale: {sA:.2f}")
-        print(f"[P1+P2] B centroid: {cB}, scale: {sB:.2f}")
+        n_matched = n_A - len(unmatched)
+        print(f"  Matched: {n_matched}/{n_A} "
+              f"({100*n_matched/n_A:.1f}%)   "
+              f"Non-overlapping: {len(unmatched)}")
 
-    best_flip, coords_A_reflected = disambiguate_reflection(coords_A_norm, coords_B_norm, nd_A, nd_B)
-    if verbose:
-        print(f"[P3] Best reflection: {best_flip}")
+    return pi, unmatched
 
-    anchors = find_mnn_anchors(M_bio, k=k_mnn)
-    if verbose:
-        print(f"[P4] MNN anchors: {len(anchors)}")
 
-    if len(anchors) >= 4:
-        t_fine, inliers, inlier_frac = ransac_translation(
-            coords_A_reflected,
-            coords_B_norm,
-            anchors,
-            n_iter=n_ransac,
-            inlier_thresh=0.05,
-        )
-        if verbose:
-            print(f"[P4] RANSAC: {len(inliers)}/{len(anchors)} inliers ({inlier_frac:.1%}), t={t_fine}")
-    else:
-        t_fine = np.zeros(2)
-        inlier_frac = 0.0
-        inliers = np.array([], dtype=int)
-        if verbose:
-            print("[P4] Too few anchors, skipping fine registration.")
-
-    coords_A_reg = coords_A_reflected + t_fine
-
-    reg_info = {
-        'cA': cA,
-        'sA': sA,
-        'pcaA': pcaA,
-        'cB': cB,
-        'sB': sB,
-        'pcaB': pcaB,
-        'best_flip': best_flip,
-        't_fine': t_fine,
-        'inliers': inliers,
-        'inlier_fraction': inlier_frac,
-        'anchors': anchors,
-    }
-
-    return coords_A_reg, coords_B_norm, reg_info
-
-
-def refine_translation_from_plan(pi, coords_A_registered, coords_B_norm, n_top=500):
-    """
-    Re-estimate translation from the current transport plan using top pairs.
-    """
-    pi = np.asarray(pi, dtype=np.float64)
-    flat = pi.ravel()
-    if flat.size == 0:
-        return np.zeros(2)
-
-    n_top = int(max(2, min(n_top, flat.size)))
-    top_idx = np.argpartition(flat, -n_top)[-n_top:]
-    rows = top_idx // pi.shape[1]
-    cols = top_idx % pi.shape[1]
-    weights = flat[top_idx]
-    w_sum = np.sum(weights)
-    if w_sum <= 0:
-        return np.zeros(2)
-
-    pA = coords_A_registered[rows]
-    pB = coords_B_norm[cols]
-    w = weights / w_sum
-
-    t_delta = np.sum(w[:, None] * (pB - pA), axis=0)
-    return t_delta
-
-
-def pairwise_align(
-    sliceA: AnnData, 
-    sliceB: AnnData, 
-    alpha: float,
-    beta: float,
-    gamma: float,
-    radius: float,
-    filePath: str,
-    alpha_dev: float = 0.4,
-    **kwargs) -> Tuple[NDArray[np.floating], NDArray[np.floating], NDArray[np.floating], dict]:
-    """
-
-    This method is written by Anup Bhowmik, CSE, BUET
-
-    Calculates and returns optimal alignment of two slices of single cell MERFISH data. 
-    
-    Args:
-        sliceA: Slice A to align.
-        sliceB: Slice B to align.
-        alpha: weight for spatial distance
-        beta: weight for cell type one-hot encoding cost
-        gamma: weight for neighborhood expression distance (e.g., JSD)
-        radius: spatial radius (Euclidean distance) defining the local neighborhood of a cell.
-        filePath: Absolute or relative directory path used for caching distance matrices and results.
-        use_rep: If ``None``, uses ``slice.X`` to calculate dissimilarity between spots, otherwise uses the representation given by ``slice.obsm[use_rep]``.
-        G_init (array-like, optional): Initial mapping to be used in FGW-OT, otherwise default is uniform mapping.
-        a_distribution (array-like, optional): Distribution of sliceA spots, otherwise default is uniform.
-        b_distribution (array-like, optional): Distribution of sliceB spots, otherwise default is uniform.
-        norm: If ``True``, scales spatial distances such that neighboring spots are at distance 1. Otherwise, spatial distances remain unchanged.
-        numItermax: Max number of iterations during FGW-OT.
-        backend: Type of backend to run calculations. For list of backends available on system: ``ot.backend.get_backend_list()``.
-        use_gpu: If ``True``, use gpu. Otherwise, use cpu. Currently we only have gpu support for Pytorch.
-        return_obj: If ``True``, additionally returns objective function output of FGW-OT.
-        verbose: If ``True``, FGW-OT is verbose.
-        gpu_verbose: If ``True``, print whether gpu is being used to user.
-        sliceA_name: Optional string identifier for slice A caching.
-        sliceB_name: Optional string identifier for slice B caching.
-        overwrite: If ``True``, forces recalculation of distance matrices ignoring cache.
-        neighborhood_dissimilarity: Name of measure for neighborhood comparisons (e.g., ``'jsd'`` for Jensen-Shannon Divergence).
-
-    Returns:
-        - Alignment of spots.
-
-        If ``return_obj = True``, additionally returns:
-        
-        - Objective function output of cost 
-    """
-
-    # Backward-compatible optional controls are read from kwargs.
-    delta = float(kwargs.get('delta', 0.0))
-    use_rep = kwargs.get('use_rep', None)
-    backend = kwargs.get('backend', ot.backend.TorchBackend())
-    use_gpu = bool(kwargs.get('use_gpu', False))
-    verbose = bool(kwargs.get('verbose', False))
-    gpu_verbose = bool(kwargs.get('gpu_verbose', True))
-    sliceA_name = kwargs.get('sliceA_name', None)
-    sliceB_name = kwargs.get('sliceB_name', None)
-    overwrite = bool(kwargs.get('overwrite', False))
-    norm = bool(kwargs.get('norm', False))
-    neighborhood_dissimilarity = kwargs.get('neighborhood_dissimilarity', 'jsd')
-
-    start_time = time.time()
-
-    if not os.path.exists(filePath):
-        os.makedirs(filePath)
-
-    logFile = open(f"{filePath}/log.txt", "w")
-
-    logFile.write(f"pairwise_align_INCENT\n")
-    currDateTime = datetime.datetime.now()
-
-    # logFile.write(f"{currDateTime.date()}, {currDateTime.strftime("%I:%M %p")} BDT, {currDateTime.strftime("%A")} \n")
-
-    logFile.write(f"{currDateTime}\n")
-    logFile.write(f"sliceA_name: {sliceA_name}, sliceB_name: {sliceB_name}\n")
-   
-
-    logFile.write(f"alpha: {alpha}\n")
-    logFile.write(f"beta: {beta}\n")
-    logFile.write(f"gamma: {gamma}\n")
-    logFile.write(f"radius: {radius}\n")
-
-
-    
-    # Determine if gpu or cpu is being used
-    if use_gpu:
-        if torch.cuda.is_available():
-            backend = ot.backend.TorchBackend()
-            if gpu_verbose:
-                print("GPU is requested and available, using gpu.")
-        else:
-            use_gpu = False
-            backend = ot.backend.NumpyBackend()
-            if gpu_verbose:
-                print("GPU is requested but not available, resorting to torch cpu.")
-    else:
-        backend = ot.backend.NumpyBackend()
-        if gpu_verbose:
-            print("Using selected backend cpu. If you want to use gpu, set use_gpu = True.")
-    
-    # check if slices are valid
-    for s in [sliceA, sliceB]:
-        if not len(s):
-            raise ValueError(f"Found empty `AnnData`:\n{s}.")
-
-    
-    # Backend
-    nx = backend
-
-    # Filter to shared genes
-    shared_genes = sliceA.var_names.intersection(sliceB.var_names)
-    if len(shared_genes) == 0:
-        raise ValueError("No shared genes between the two slices.")
-    sliceA = sliceA[:, shared_genes]
-    sliceB = sliceB[:, shared_genes]
-
-
-    # Filter to shared cell types
-    # This is needed for the cell-type mismatch penalty, and also ensures that the neighborhood distributions are comparable (same set of cell types).
-    shared_cell_types = pd.Index(sliceA.obs['cell_type_annot']).unique().intersection(pd.Index(sliceB.obs['cell_type_annot']).unique())
-    if len(shared_cell_types) == 0:
-        raise ValueError("No shared cell types between the two slices.")
-    sliceA = sliceA[sliceA.obs['cell_type_annot'].isin(shared_cell_types)]
-    sliceB = sliceB[sliceB.obs['cell_type_annot'].isin(shared_cell_types)]
-
-    
-    # Calculate spatial distances
-    coordinatesA = sliceA.obsm['spatial'].copy()
-    coordinatesB = sliceB.obsm['spatial'].copy()
-    coordinatesA = nx.from_numpy(coordinatesA)
-    coordinatesB = nx.from_numpy(coordinatesB)
-    
-    if isinstance(nx,ot.backend.TorchBackend):
-        coordinatesA = coordinatesA.float()
-        coordinatesB = coordinatesB.float()
-    D_A = ot.dist(coordinatesA, coordinatesA, metric='euclidean')
-    D_B = ot.dist(coordinatesB, coordinatesB, metric='euclidean')
-
-    # Calculate gene expression dissimilarity
-    # filePath = '/content/drive/MyDrive/Thesis_data_anup/local_data'
-    cosine_dist_gene_expr = cosine_distance(sliceA, sliceB, sliceA_name, sliceB_name, filePath, use_rep = use_rep, use_gpu = use_gpu, nx = nx, beta = beta, overwrite=overwrite)
-
-    # ── Explicit cell-type mismatch penalty ──────────────────────────────
-    # Binary matrix: 0 for same type, 1 for different type.
-    # Added to M1 so it enters the FW gradient directly → strong cell-type signal.
-
-    _lab_A = np.asarray(sliceA.obs['cell_type_annot'].values)
-    _lab_B = np.asarray(sliceB.obs['cell_type_annot'].values)
-    M_celltype = (_lab_A[:, None] != _lab_B[None, :]).astype(np.float64)
-
-    if isinstance(cosine_dist_gene_expr, torch.Tensor):
-        M_celltype_t = torch.from_numpy(M_celltype).to(cosine_dist_gene_expr.device)
-        M1 = (1 - beta) * cosine_dist_gene_expr + beta * M_celltype_t
-    else:
-        M1_combined = (1 - beta) * cosine_dist_gene_expr + beta * M_celltype
-        M1 = nx.from_numpy(M1_combined)
-
-    logFile.write(f"[cell_type_penalty] beta={beta}, M_celltype shape={M_celltype.shape}\n")
-
-
-    # jensenshannon_divergence_backend actually returns jensen shannon distance
-    # neighborhood_distribution_slice_1, neighborhood_distribution_slice_1 will be pre computed
-
-    if os.path.exists(f"{filePath}/neighborhood_distribution_{sliceA_name}.npy") and not overwrite:
-        print("Loading precomputed neighborhood distribution of slice A")
-        neighborhood_distribution_sliceA = np.load(f"{filePath}/neighborhood_distribution_{sliceA_name}.npy")
-    else:
-        print("Calculating neighborhood distribution of slice A")
-        neighborhood_distribution_sliceA = neighborhood_distribution(sliceA, radius = radius)
-
-
-        neighborhood_distribution_sliceA += 0.01 # for avoiding zero division error
-        # print("Saving neighborhood distribution of slice A")
-        # np.save(f"{filePath}/neighborhood_distribution_{sliceA_name}.npy", neighborhood_distribution_sliceA)
-
-
-    if os.path.exists(f"{filePath}/neighborhood_distribution_{sliceB_name}.npy") and not overwrite:
-        print("Loading precomputed neighborhood distribution of slice B")
-        neighborhood_distribution_sliceB = np.load(f"{filePath}/neighborhood_distribution_{sliceB_name}.npy")
-    else:
-        print("Calculating neighborhood distribution of slice B")
-        neighborhood_distribution_sliceB = neighborhood_distribution(sliceB, radius = radius)
-
-
-        neighborhood_distribution_sliceB += 0.01 # for avoiding zero division error
-        # print("Saving neighborhood distribution of slice B")
-        # np.save(f"{filePath}/neighborhood_distribution_{sliceB_name}.npy", neighborhood_distribution_sliceB)
-
-
-    if ('numpy' in str(type(neighborhood_distribution_sliceA))) and use_gpu:
-        neighborhood_distribution_sliceA = torch.from_numpy(neighborhood_distribution_sliceA)
-    if ('numpy' in str(type(neighborhood_distribution_sliceB))) and use_gpu:
-        neighborhood_distribution_sliceB = torch.from_numpy(neighborhood_distribution_sliceB)
-
-    if use_gpu:
-        neighborhood_distribution_sliceA = neighborhood_distribution_sliceA.cuda()
-        neighborhood_distribution_sliceB = neighborhood_distribution_sliceB.cuda()
-
-    if neighborhood_dissimilarity == 'jsd':
-        if os.path.exists(f"{filePath}/js_dist_neighborhood_{sliceA_name}_{sliceB_name}.npy") and not overwrite:
-            print("Loading precomputed JSD of neighborhood distribution for slice A and slice B")
-            js_dist_neighborhood = np.load(f"{filePath}/js_dist_neighborhood_{sliceA_name}_{sliceB_name}.npy")
-            if use_gpu and isinstance(nx, ot.backend.TorchBackend):
-                js_dist_neighborhood = torch.from_numpy(js_dist_neighborhood).cuda()
-        else:
-            print("Calculating JSD of neighborhood distribution for slice A and slice B")
-
-            js_dist_neighborhood = jensenshannon_divergence_backend(neighborhood_distribution_sliceA, neighborhood_distribution_sliceB)
-
-  
-        if isinstance(js_dist_neighborhood, torch.Tensor):
-            M2 = js_dist_neighborhood
-            if use_gpu and js_dist_neighborhood.device.type != 'cuda':
-                M2 = M2.cuda()
-        else:
-            M2 = nx.from_numpy(js_dist_neighborhood)
-
-    elif neighborhood_dissimilarity == 'cosine':
-        if isinstance(neighborhood_distribution_sliceA, torch.Tensor) or isinstance(neighborhood_distribution_sliceB, torch.Tensor):
-            ndA = neighborhood_distribution_sliceA
-            ndB = neighborhood_distribution_sliceB
-            if not isinstance(ndA, torch.Tensor):
-                ndA = torch.from_numpy(np.asarray(ndA))
-            if not isinstance(ndB, torch.Tensor):
-                ndB = torch.from_numpy(np.asarray(ndB))
-            if use_gpu:
-                ndA = ndA.cuda()
-                ndB = ndB.cuda()
-            numerator = ndA @ ndB.T
-            denom = ndA.norm(dim=1)[:, None] * ndB.norm(dim=1)[None, :]
-            cosine_dist_neighborhood = 1 - numerator / denom
-            M2 = cosine_dist_neighborhood
-        else:
-            ndA = np.asarray(neighborhood_distribution_sliceA)
-            ndB = np.asarray(neighborhood_distribution_sliceB)
-            numerator = ndA @ ndB.T
-            denom = np.linalg.norm(ndA, axis=1)[:, None] * np.linalg.norm(ndB, axis=1)[None, :]
-            cosine_dist_neighborhood = 1 - numerator / denom
-            M2 = nx.from_numpy(cosine_dist_neighborhood)
-
-    elif neighborhood_dissimilarity == 'msd':
-        if isinstance(neighborhood_distribution_sliceA, torch.Tensor):
-            ndA = neighborhood_distribution_sliceA.detach().cpu().numpy()
-        else:
-            ndA = np.asarray(neighborhood_distribution_sliceA)
-        if isinstance(neighborhood_distribution_sliceB, torch.Tensor):
-            ndB = neighborhood_distribution_sliceB.detach().cpu().numpy()
-        else:
-            ndB = np.asarray(neighborhood_distribution_sliceB)
-
-        msd_neighborhood = pairwise_msd(ndA, ndB)
-        M2 = nx.from_numpy(msd_neighborhood)
-
-    else:
-        raise ValueError(
-            "Invalid neighborhood_dissimilarity. Expected one of {'jsd','cosine','msd'}; "
-            f"got {neighborhood_dissimilarity!r}."
-        )
-    
-    # Compute neighborhood distributions (existing code)
-    nd_A = neighborhood_distribution_sliceA.detach().cpu().numpy() if isinstance(neighborhood_distribution_sliceA, torch.Tensor) else np.asarray(neighborhood_distribution_sliceA)
-    nd_B = neighborhood_distribution_sliceB.detach().cpu().numpy() if isinstance(neighborhood_distribution_sliceB, torch.Tensor) else np.asarray(neighborhood_distribution_sliceB)
-    
-    # ─── LAYER 2: Hemisphere identification ───────────────────────────────
-    hemisphere, left_mask, right_mask, pc1_B, midline_B = \
-        identify_target_hemisphere(sliceA, sliceB, nd_A, nd_B)
-    
-    logFile.write(f"Hemisphere identification: {hemisphere}\n")
-    # logFile.write(f"JSD to L: {jsd_left:.4f}, JSD to R: {jsd_right:.4f}\n")
-
-    # ─── LAYER 1: Shared-scale normalization ──────────────────────────────
-    # CRITICAL FIX: replace independent max-norm with shared-scale norm
-    # Old (wrong):
-    #   D_A /= nx.max(D_A)
-    #   D_B /= nx.max(D_B)
-    # New (correct):
-    scale = nx.max(D_B)   # Normalize BOTH by the scale of the larger structure
-    D_A /= scale
-    D_B /= scale
-
-    if isinstance(nx,ot.backend.TorchBackend) and use_gpu:
-        D_A = D_A.cuda()
-        D_B = D_B.cuda()
-
-    # ─── LAYER 3: Spatial coherence cost ──────────────────────────────────
-    M_coh = spatial_coherence_cost(sliceB, pc1_B, midline_B, hemisphere, 
-                                    lambda_coh=0.5)
-    if isinstance(cosine_dist_gene_expr, torch.Tensor):
-        M_coh_t = torch.from_numpy(M_coh).float().to(cosine_dist_gene_expr.device)
-        M1 = M1 + 0.5 * M_coh_t[None, :]
-    else:
-        M1 = M1 + 0.5 * M_coh[np.newaxis, :]
-
-    # ─── LAYER 2 continued: hemisphere-aware initialization ───────────────
-    G_init_hemi = hemisphere_aware_G0(sliceA, sliceB, hemisphere, 
-                                       left_mask, right_mask)
-    
-    labels, Phi = joint_anatomical_embedding(
-    neighborhood_distribution_sliceA, neighborhood_distribution_sliceB)
-
-    a_distribution, b_distribution, shared_clusters = adaptive_marginals(labels, sliceA.shape[0], sliceB.shape[0])
-
-    labels_A = labels[:sliceA.shape[0]]
-    labels_B = labels[sliceA.shape[0]:]
-    M_clust  = cluster_coherence_cost(labels_A, labels_B)
-
-    # M1 is now: gene_expr + beta*celltype + delta*cluster_coherence
-    M1 += delta*M_clust
-
-    if isinstance(nx,ot.backend.TorchBackend) and use_gpu:
-        if not isinstance(M1, torch.Tensor):
-            M1 = nx.from_numpy(M1)
-        if not isinstance(M2, torch.Tensor):
-            M2 = nx.from_numpy(M2)
-        M1 = M1.cuda()
-        M2 = M2.cuda()
-    
-    # init distributions
-    if a_distribution is None:
-        # uniform distribution, a = array([1/n, 1/n, ...])
-        a = nx.ones((sliceA.shape[0],))/sliceA.shape[0]
-    else:
-        a = nx.from_numpy(a_distribution)
-        
-    if b_distribution is None:
-        b = nx.ones((sliceB.shape[0],))/sliceB.shape[0]
-    else:
-        b = nx.from_numpy(b_distribution)
-
-    if isinstance(nx,ot.backend.TorchBackend) and use_gpu:
-        a = a.cuda()
-        b = b.cuda()
-    
-    if norm:
-        # Heritage PASTE flag: scaled min distance to 1. 
-        # Replaced globally by max-normalization [0,1] at distance calculation for stability.
-        pass
-    
-    def _to_np(x):
-        if isinstance(x, torch.Tensor):
-            return x.detach().cpu().numpy()
-        return np.asarray(x)
-
-    # Combined biological cost (numpy, no spatial term yet)
-    M_bio_np = ((1.0 - beta) * _to_np(cosine_dist_gene_expr)
-                + beta * M_celltype
-                + gamma * _to_np(M2))
-
-    # Pre-registration
-    k_mnn = int(kwargs.get('k_mnn', 15))
-    n_ransac = int(kwargs.get('n_ransac', 1000))
-    coords_A_reg, coords_B_norm, reg_info = preregister(
-        sliceA,
-        sliceB,
-        nd_A,
-        nd_B,
-        M_bio_np,
-        k_mnn=k_mnn,
-        n_ransac=n_ransac,
-        verbose=verbose,
-    )
-
-    logFile.write(f"Reflection: {reg_info['best_flip']}\n")
-    logFile.write(f"Fine translation: {reg_info['t_fine']}\n")
-    logFile.write(f"RANSAC inlier fraction: {reg_info['inlier_fraction']:.3f}\n")
-
-    # Spatial deviation cost and adaptive spatial weighting
-    M_dev = spatial_deviation_cost(coords_A_reg, coords_B_norm)
-    alpha_dev_eff = float(alpha_dev) * min(1.0, float(reg_info['inlier_fraction']) / 0.4)
-    logFile.write(f"Effective alpha_dev: {alpha_dev_eff:.3f}\n")
-
-    M_total = (1.0 - alpha_dev_eff) * M_bio_np + alpha_dev_eff * M_dev
-
-    # Standard linear OT with uniform marginals
-    a = np.ones(sliceA.shape[0], dtype=np.float64) / sliceA.shape[0]
-    b = np.ones(sliceB.shape[0], dtype=np.float64) / sliceB.shape[0]
-    pi = ot.emd(a, b, M_total.astype(np.float64))
-
-    # EM refinement (translation only)
-    for em_iter in range(3):
-        top_n = min(500, pi.size)
-        flat = pi.flatten()
-        flat_idx = np.argsort(flat)[-top_n:]
-        rows = flat_idx // pi.shape[1]
-        cols = flat_idx % pi.shape[1]
-        w = flat[flat_idx]
-
-        if np.sum(w) <= 0:
-            break
-
-        w = w / np.sum(w)
-        pA = coords_A_reg[rows]
-        pB = coords_B_norm[cols]
-        t_new = np.sum(w[:, None] * (pB - pA), axis=0)
-
-        t_change = np.linalg.norm(t_new - reg_info['t_fine'])
-        coords_A_reg = coords_A_reg + t_new - reg_info['t_fine']
-        reg_info['t_fine'] = t_new
-
-        logFile.write(f"EM iter {em_iter}: |Dt|={t_change:.5f}\n")
-
-        M_dev = spatial_deviation_cost(coords_A_reg, coords_B_norm)
-        M_total = (1.0 - alpha_dev_eff) * M_bio_np + alpha_dev_eff * M_dev
-        pi = ot.emd(a, b, M_total.astype(np.float64))
-
-        if t_change < 1e-3:
-            break
-
-    G_np = np.ones((a.shape[0], b.shape[0]), dtype=np.float64) / (a.shape[0] * b.shape[0])
-
-    if neighborhood_dissimilarity == 'jsd':
-        initial_obj_neighbor = np.sum(_to_np(js_dist_neighborhood) * G_np)
-    if neighborhood_dissimilarity == 'msd':
-        initial_obj_neighbor = np.sum(_to_np(msd_neighborhood) * G_np)
-    elif neighborhood_dissimilarity == 'cosine':
-        initial_obj_neighbor = np.sum(_to_np(cosine_dist_neighborhood) * G_np)
-
-    initial_obj_gene = np.sum(_to_np(cosine_dist_gene_expr) * G_np)
-
-    if neighborhood_dissimilarity == 'jsd':
-        # print(f"Initial objective neighbor (jsd): {initial_obj_neighbor}")
-        logFile.write(f"Initial objective neighbor (jsd): {initial_obj_neighbor}\n")
-
-    elif neighborhood_dissimilarity == 'cosine':
-        # print(f"Initial objective neighbor (cosine_dist): {initial_obj_neighbor_cos}")
-        logFile.write(f"Initial objective neighbor (cosine_dist): {initial_obj_neighbor}\n")
-    elif neighborhood_dissimilarity == 'msd':
-        # print(f"Initial objective neighbor (msd): {initial_obj_neighbor}")
-        logFile.write(f"Initial objective neighbor (mean sq distance): {initial_obj_neighbor}\n")
-
-    # print(f"Initial objective gene expr (cosine_dist): {initial_obj_gene}")
-    logFile.write(f"Initial objective (cosine_dist): {initial_obj_gene}\n")
-    
-
-    pi = np.asarray(pi, dtype=np.float64)
-
-    if neighborhood_dissimilarity == 'jsd':
-        max_indices = np.argmax(pi, axis=1)
-        # multiply each value of max_indices from pi_mat with the corresponding js_dist entry
-        jsd_error = np.zeros(max_indices.shape)
-        _dist_np = _to_np(js_dist_neighborhood)
-        for i in range(len(max_indices)):
-            jsd_error[i] = pi[i][max_indices[i]] * _dist_np[i][max_indices[i]]
-
-        final_obj_neighbor = np.sum(jsd_error)
-    elif neighborhood_dissimilarity == 'msd':
-        final_obj_neighbor = np.sum(_to_np(msd_neighborhood)*pi)
-
-    elif neighborhood_dissimilarity == 'cosine':
-        max_indices = np.argmax(pi, axis=1)
-        # multiply each value of max_indices from pi_mat with the corresponding js_dist entry
-        cos_error = np.zeros(max_indices.shape)
-        _dist_np = _to_np(cosine_dist_neighborhood)
-        for i in range(len(max_indices)):
-            cos_error[i] = pi[i][max_indices[i]] * _dist_np[i][max_indices[i]]
-
-        final_obj_neighbor = np.sum(cos_error)
-
-
-    final_obj_gene = np.sum(_to_np(cosine_dist_gene_expr) * pi)
-
-    if neighborhood_dissimilarity == 'jsd':
-        logFile.write(f"Final objective neighbor (jsd): {final_obj_neighbor}\n")
-        # print(f"Final objective neighbor (jsd): {final_obj_neighbor}\n")
-    elif neighborhood_dissimilarity == 'cosine':
-        logFile.write(f"Final objective neighbor (cosine_dist): {final_obj_neighbor}\n")
-        # print(f"Final objective neighbor (cosine_dist): {final_obj_neighbor}\n")
-
-    logFile.write(f"Final objective gene expr(cosine_dist): {final_obj_gene}\n")
-    # print(f"Final objective (cosine_dist): {final_obj_gene}\n")
-
-    # Surface objective diagnostics to caller while keeping the new BIOT return signature.
-    reg_info['initial_obj_neighbor'] = float(initial_obj_neighbor)
-    reg_info['initial_obj_gene_cos'] = float(initial_obj_gene)
-    reg_info['final_obj_neighbor'] = float(final_obj_neighbor)
-    reg_info['final_obj_gene_cos'] = float(final_obj_gene)
-    
-
-    logFile.write(f"Runtime: {str(time.time() - start_time)} seconds\n")
-    # print(f"Runtime: {str(time.time() - start_time)} seconds\n")
-    logFile.write(f"---------------------------------------------\n\n\n")
-
-    logFile.close()
-
-    # new code ends
-
-    if isinstance(backend,ot.backend.TorchBackend) and use_gpu:
-        torch.cuda.empty_cache()
-
-    if kwargs.get('visualize', False):
-        visualize_alignment(
-            pi,
-            sliceA,
-            sliceB,
-            coords_A_reg,
-            coords_B_norm,
-            reg_info,
-            top_k=int(kwargs.get('visualize_top_k', 200)),
-            output_path=kwargs.get('visualize_output_path', None),
-        )
-
-    if kwargs.get('visualize_on_B', False):
-        visualize_alignment_on_B(
-            pi,
-            sliceA,
-            sliceB,
-            coords_A_reg,
-            coords_B_norm,
-        )
-
-    return pi, coords_A_reg, coords_B_norm, reg_info
-
+# ═══════════════════════════════════════════════════════════════════════════════
+# Module 6 — Neighbourhood distribution (reused from INCENT)
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def neighborhood_distribution(curr_slice, radius):
-    """
-    This method is added by Anup Bhowmik
-    Args:
-        curr_slice: Slice to get niche distribution for.
-        pairwise_distances: Pairwise distances between cells of a slice.
-        radius: Radius of the niche.
-
-    Returns:
-        niche_distribution: Niche distribution for the slice.
-    """
-
+    """Exact copy of INCENT's neighbourhood_distribution. No changes needed."""
+    from tqdm import tqdm
     cell_types = np.array(curr_slice.obs['cell_type_annot'].astype(str))
-    unique_cell_types = np.unique(cell_types)
-    cell_type_to_index = {ct: i for i, ct in enumerate(unique_cell_types)}
-    
-    source_coords = curr_slice.obsm['spatial']
-    n_cells = curr_slice.shape[0]
-    
-    cells_within_radius = np.zeros((n_cells, len(unique_cell_types)), dtype=float)
+    unique_ct  = np.unique(cell_types)
+    ct2idx     = {c: i for i, c in enumerate(unique_ct)}
+    coords     = curr_slice.obsm['spatial']
+    n          = curr_slice.shape[0]
 
-    # Use BallTree instead of full O(n^2) distance matrix for memory & speed scalability
-    from sklearn.neighbors import BallTree
-    tree = BallTree(source_coords)
-    neighbor_lists = tree.query_radius(source_coords, r=radius)
+    tree = BallTree(coords)
+    nbrs = tree.query_radius(coords, r=radius)
 
-    for i in tqdm(range(n_cells), desc="Computing neighborhood distribution"):
-        neighbors = neighbor_lists[i]
-        for ind in neighbors:
-            ct = cell_types[ind]
-            cells_within_radius[i][cell_type_to_index[ct]] += 1
-            
-    # CRITICAL FIX: Normalize to probability distributions before computing JSD
-    row_sums = cells_within_radius.sum(axis=1, keepdims=True)
-    # Avoid division by zero for isolated cells
-    row_sums[row_sums == 0] = 1 
-    cells_within_radius = cells_within_radius / row_sums
+    dist = np.zeros((n, len(unique_ct)), dtype=float)
+    for i in tqdm(range(n), desc="Niche distribution"):
+        for idx in nbrs[i]:
+            dist[i, ct2idx[cell_types[idx]]] += 1.0
 
-    return cells_within_radius
+    row_sums = dist.sum(axis=1, keepdims=True)
+    row_sums[row_sums == 0] = 1.0
+    return dist / row_sums
 
 
-def cosine_distance(sliceA, sliceB, sliceA_name, sliceB_name, filePath, use_rep = None, use_gpu = False, nx = ot.backend.NumpyBackend(), beta = 0.8, overwrite = False):
-    from sklearn.metrics.pairwise import cosine_distances
-    import os
+# ═══════════════════════════════════════════════════════════════════════════════
+# Module 7 — Master pairwise_align replacement
+# ═══════════════════════════════════════════════════════════════════════════════
 
-    A_X, B_X = nx.from_numpy(to_dense_array(extract_data_matrix(sliceA,use_rep))), nx.from_numpy(to_dense_array(extract_data_matrix(sliceB,use_rep)))
-
-    if isinstance(nx,ot.backend.TorchBackend) and use_gpu:
-        A_X = A_X.cuda()
-        B_X = B_X.cuda()
-
-   
-    s_A = A_X + 0.01
-    s_B = B_X + 0.01
-
-    fileName = f"{filePath}/cosine_dist_gene_expr_{sliceA_name}_{sliceB_name}.npy"
-    
-    if os.path.exists(fileName) and not overwrite:
-        print("Loading precomputed Cosine distance of gene expression for slice A and slice B")
-        cosine_dist_gene_expr = np.load(fileName)
-        if use_gpu and isinstance(nx, ot.backend.TorchBackend):
-            cosine_dist_gene_expr = torch.from_numpy(cosine_dist_gene_expr).cuda()
-    else:
-        print("Calculating cosine dist of gene expression for slice A and slice B")
-
-        if isinstance(s_A, torch.Tensor) and isinstance(s_B, torch.Tensor):
-            # Calculate manually using PyTorch to stay on GPU
-            s_A_norm = s_A / s_A.norm(dim=1)[:, None]
-            s_B_norm = s_B / s_B.norm(dim=1)[:, None]
-            cosine_dist_gene_expr = 1 - torch.mm(s_A_norm, s_B_norm.T)
-            np.save(fileName, cosine_dist_gene_expr.cpu().detach().numpy())
-        else:
-            from sklearn.metrics.pairwise import cosine_distances
-            cosine_dist_gene_expr = cosine_distances(s_A, s_B)
-            np.save(fileName, cosine_dist_gene_expr)
-
-    return cosine_dist_gene_expr
-
-
-def visualize_alignment(pi, sliceA, sliceB, coords_A_reg, coords_B_norm,
-                         reg_info, top_k=200, output_path=None):
+def pairwise_align(sliceA, sliceB,
+                   # biological parameters
+                   gamma       = 0.5,
+                   radius      = 100,
+                   # registration parameters
+                   grid_size   = 128,
+                   sigma_px    = 4,
+                   num_angles  = 360,
+                   # matching parameters
+                   search_radius = None,
+                   soft_temp     = 0.5,
+                   # bookkeeping
+                   filePath     = './sff_output',
+                   use_rep      = None,
+                   sliceA_name  = 'A',
+                   sliceB_name  = 'B',
+                   return_extra = False,
+                   verbose      = True,
+                   **kwargs):
     """
-    Correct alignment visualization:
-    - Plot slice B cells at coords_B_norm (canonical frame)
-    - Plot slice A cells at coords_A_reg  (registered into B's frame)
-    - Draw correspondence lines for top-k highest-weight pi pairs
+    SFF-INCENT  —  drop-in replacement for INCENT's pairwise_align().
+
+    Parameters
+    ----------
+    sliceA, sliceB : AnnData
+        Must have .obsm['spatial'], .obs['cell_type_annot'], .X gene expression.
+    gamma          : float [0,1]
+        Weight of niche-JSD vs gene-cosine in biological cost. 0 = genes only.
+    radius         : float
+        Neighbourhood radius for niche distribution (same unit as spatial coords).
+    grid_size      : int
+        Density map resolution. 128 is good for ~15k cells. Use 64 for speed.
+    sigma_px       : float
+        KDE bandwidth in grid pixels. Larger = smoother, more robust registration.
+    search_radius  : float or None
+        Spatial search radius for cell matching (physical units of B).
+        If None: auto-estimated as 3 × 75th-percentile NN-distance in B.
+    soft_temp      : float [0,1]
+        Softmax temperature for local assignment. 0 = hard argmin, 1 = soft.
+    return_extra   : bool
+        If True, return (pi, coords_A_reg, coords_B, transform_dict).
+
+    Returns
+    -------
+    pi             : (n_A, n_B) ndarray   transport plan
+    [optional]     : coords_A_reg, coords_B, transform
     """
-    import matplotlib.pyplot as plt
-    import matplotlib.lines as mlines
+    os.makedirs(filePath, exist_ok=True)
+    log_path = f"{filePath}/sff_{sliceA_name}_{sliceB_name}.log"
+    log = open(log_path, 'w')
+    log.write(f"SFF-INCENT  |  {sliceA_name} → {sliceB_name}\n")
+    log.write(f"Started: {datetime.datetime.now()}\n\n")
+    t0 = time.time()
 
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    # ── 0. Pre-processing: shared genes and cell types (INCENT standard) ─────
+    shared_genes = sliceA.var_names.intersection(sliceB.var_names)
+    if len(shared_genes) == 0:
+        raise ValueError("No shared genes.")
+    sA = sliceA[:, shared_genes].copy()
+    sB = sliceB[:, shared_genes].copy()
 
-    # ── Left panel: raw coordinates (shows the pre-registration problem) ──
-    ax = axes[0]
-    raw_A = sliceA.obsm['spatial']
-    raw_B = sliceB.obsm['spatial']
-    ax.scatter(raw_A[:, 0], raw_A[:, 1], s=2, c='#534AB7', alpha=0.4, label='Slice A (raw)')
-    ax.scatter(raw_B[:, 0], raw_B[:, 1], s=2, c='#1D9E75', alpha=0.4, label='Slice B (raw)')
-    ax.set_title('Before pre-registration (raw coords)', fontsize=11)
-    ax.legend(markerscale=4, fontsize=9)
-    ax.set_aspect('equal')
+    shared_ct = set(sA.obs['cell_type_annot']) & set(sB.obs['cell_type_annot'])
+    if len(shared_ct) == 0:
+        raise ValueError("No shared cell types.")
+    sA = sA[sA.obs['cell_type_annot'].isin(shared_ct)]
+    sB = sB[sB.obs['cell_type_annot'].isin(shared_ct)]
 
-    # ── Right panel: registered coordinates with correspondence lines ──
-    ax = axes[1]
-    ax.scatter(coords_B_norm[:, 0], coords_B_norm[:, 1],
-               s=2, c='#1D9E75', alpha=0.3, label='Slice B')
-    ax.scatter(coords_A_reg[:, 0], coords_A_reg[:, 1],
-               s=2, c='#534AB7', alpha=0.6, label='Slice A (registered)')
+    n_A, n_B = sA.shape[0], sB.shape[0]
+    log.write(f"n_A={n_A}  n_B={n_B}  "
+              f"shared_genes={len(shared_genes)}  shared_ct={len(shared_ct)}\n")
 
-    # Draw top-k correspondence lines
-    flat = pi.flatten()
-    top_idx = np.argsort(flat)[-top_k:]
-    for idx in top_idx:
-        i = idx // pi.shape[1]
-        j = idx %  pi.shape[1]
-        weight = flat[idx]
-        ax.plot([coords_A_reg[i, 0], coords_B_norm[j, 0]],
-                [coords_A_reg[i, 1], coords_B_norm[j, 1]],
-                'k-', alpha=min(weight * pi.shape[0] * pi.shape[1] * 0.3, 0.8),
-                linewidth=0.5)
+    # ── 1. Biological cost matrices ───────────────────────────────────────────
+    import scipy.sparse as sp
+    def to_dense(X):
+        return X.toarray() if sp.issparse(X) else np.asarray(X)
 
-    ax.set_title('After pre-registration (canonical frame)', fontsize=11)
-    ax.legend(markerscale=4, fontsize=9)
-    ax.set_aspect('equal')
+    A_X = to_dense(sA.X if use_rep is None else sA.obsm[use_rep]) + 0.01
+    B_X = to_dense(sB.X if use_rep is None else sB.obsm[use_rep]) + 0.01
+    cosine_dist = cosine_distances(A_X, B_X).astype(np.float32)
 
-    plt.tight_layout()
-    if output_path:
-        plt.savefig(output_path, dpi=150, bbox_inches='tight')
-    plt.show()
+    nd_A = neighborhood_distribution(sA, radius).astype(np.float32) + 0.01
+    nd_B = neighborhood_distribution(sB, radius).astype(np.float32) + 0.01
+
+    t1 = time.time()
+    log.write(f"Biological costs: {t1-t0:.1f}s\n")
+    if verbose:
+        print(f"[SFF] Biological costs done ({t1-t0:.1f}s)")
+
+    # ── 2. Spatial registration (no biology used here) ───────────────────────
+    if verbose:
+        print(f"[SFF] Running Fourier-Mellin registration "
+              f"(grid={grid_size}, σ={sigma_px}px)...")
+
+    transform, coords_A_reg, coords_B = find_transform(
+        sA, sB,
+        grid_size=grid_size,
+        sigma_px=sigma_px,
+        num_angles=num_angles,
+        verbose=verbose)
+
+    t2 = time.time()
+    log.write(f"Registration: flip={transform['flip']}  "
+              f"angle={transform['angle']:.2f}°  "
+              f"scale={transform['scale']:.4f}  "
+              f"tx={transform['tx_px']}  ty={transform['ty_px']}  "
+              f"conf={transform['confidence']:.4f}  "
+              f"time={t2-t1:.1f}s\n")
+    if verbose:
+        print(f"[SFF] Registration done ({t2-t1:.1f}s)")
+
+    # ── 3. Local biological matching ──────────────────────────────────────────
+    if verbose:
+        print(f"[SFF] Local biological matching...")
+
+    pi, unmatched = local_biological_matching(
+        sA, sB,
+        coords_A_reg, coords_B,
+        nd_A, nd_B,
+        cosine_dist,
+        gamma=gamma,
+        search_radius=search_radius,
+        soft_temp=soft_temp,
+        verbose=verbose)
+
+    t3 = time.time()
+    log.write(f"Matching: unmatched={len(unmatched)}/{n_A}  time={t3-t2:.1f}s\n")
+    log.write(f"Total: {t3-t0:.1f}s\n")
+    log.close()
+
+    if verbose:
+        print(f"[SFF] Done. Total: {t3-t0:.1f}s")
+
+    if return_extra:
+        return pi, coords_A_reg, coords_B, transform
+    return pi
 
 
-def visualize_alignment_on_B(pi, sliceA, sliceB, coords_A_reg, coords_B_norm):
+# ═══════════════════════════════════════════════════════════════════════════════
+# Module 8 — Visualization
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def plot_alignment(pi, sliceA, sliceB,
+                   coords_A_reg, coords_B,
+                   top_k=300, figsize=(14, 6), save_path=None):
     """
-    Alternative: show only the registered frame.
-    Color cells by their matched partner's cell type — confirms anatomical correctness.
+    Two-panel alignment plot.
+
+    Left:  raw coordinates — shows the pre-registration problem.
+    Right: registered coordinates — shows the alignment quality.
+           Lines connect top-k highest-weight (i,j) pairs in π.
+           A cells coloured by matched B cell type → anatomical correctness check.
     """
     import matplotlib.pyplot as plt
     import matplotlib.cm as cm
 
-    # For each A cell, find its top matched B cell
-    matched_B = np.argmax(pi, axis=1)   # (n_A,)
+    ct_B   = np.array(sliceB.obs['cell_type_annot'].values)
+    uniq   = np.unique(ct_B)
+    ct2col = {c: i for i, c in enumerate(uniq)}
+    cmap   = plt.get_cmap('tab20', len(uniq))
 
-    # Color A cells by the cell type of their match in B
-    ctypes_B = np.array(sliceB.obs['cell_type_annot'].values)
-    unique_ct = np.unique(ctypes_B)
-    ct_to_idx = {c: i for i, c in enumerate(unique_ct)}
-    colors = np.array([ct_to_idx[ctypes_B[j]] for j in matched_B])
+    # Top-k pairs by transport weight
+    flat     = pi.flatten()
+    top_flat = np.argsort(flat)[-top_k:]
+    rows     = top_flat // pi.shape[1]
+    cols     = top_flat %  pi.shape[1]
+    weights  = flat[top_flat]
+    w_norm   = weights / (weights.max() + 1e-12)
 
-    fig, ax = plt.subplots(figsize=(8, 7))
-    ax.scatter(coords_B_norm[:, 0], coords_B_norm[:, 1],
-               s=3, c='lightgray', alpha=0.2, label='Slice B (background)')
-    sc = ax.scatter(coords_A_reg[:, 0], coords_A_reg[:, 1],
-                    s=4, c=colors, cmap='tab20', alpha=0.8,
-                    label='Slice A (colored by matched B cell type)')
-    ax.set_title('Alignment quality: A cells colored by matched B cell type')
+    fig, axes = plt.subplots(1, 2, figsize=figsize)
+
+    # ── Left: raw ──────────────────────────────────────────────────────────
+    ax = axes[0]
+    raw_A = sliceA.obsm['spatial']
+    raw_B = sliceB.obsm['spatial']
+    ax.scatter(*raw_B.T, s=1, c='#9FE1CB', alpha=0.4, rasterized=True, label='B')
+    ax.scatter(*raw_A.T, s=1, c='#AFA9EC', alpha=0.4, rasterized=True, label='A')
+    ax.set_title('Raw coordinates (before registration)', fontsize=10)
+    ax.legend(markerscale=5, fontsize=8)
     ax.set_aspect('equal')
+    ax.axis('off')
+
+    # ── Right: registered ─────────────────────────────────────────────────
+    ax = axes[1]
+    ax.scatter(*coords_B.T, s=1, c='#9FE1CB', alpha=0.3, rasterized=True)
+
+    # Colour A cells by matched B cell type
+    matched_j = np.argmax(pi, axis=1)
+    colors    = np.array([ct2col[ct_B[j]] for j in matched_j])
+    ax.scatter(*coords_A_reg.T, s=3, c=colors,
+               cmap='tab20', vmin=0, vmax=len(uniq),
+               alpha=0.8, rasterized=True,
+               label='A (coloured by matched B cell type)')
+
+    # Correspondence lines for top-k pairs
+    for idx in range(len(rows)):
+        i, j = rows[idx], cols[idx]
+        ax.plot([coords_A_reg[i, 0], coords_B[j, 0]],
+                [coords_A_reg[i, 1], coords_B[j, 1]],
+                'k-', alpha=float(w_norm[idx]) * 0.6,
+                linewidth=0.4)
+
+    ax.set_title('Registered (A coloured by matched B cell type)', fontsize=10)
+    ax.set_aspect('equal')
+    ax.axis('off')
+
     plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"Saved to {save_path}")
     plt.show()
 
-    
+
+def plot_density_maps(sliceA, sliceB, transform,
+                      grid_size=128, sigma_px=4, n_show=4):
+    """
+    Diagnostic: show density map channels and the phase correlation map.
+    Helps verify that registration is correct before cell matching.
+    """
+    import matplotlib.pyplot as plt
+
+    ct_A = np.array(sliceA.obs['cell_type_annot'].astype(str))
+    ct_B = np.array(sliceB.obs['cell_type_annot'].astype(str))
+
+    imgB, ct_B_names, affB = build_density_map(
+        sliceB.obsm['spatial'], ct_B,
+        grid_size=grid_size, sigma_px=sigma_px)
+
+    flip_x, flip_y = transform['flip']
+    cA_flip = sliceA.obsm['spatial'] * np.array([flip_x, flip_y])
+    imgA, ct_A_names, affA = build_density_map(
+        cA_flip, ct_A, grid_size=grid_size, sigma_px=sigma_px)
+
+    shared = sorted(set(ct_A_names) & set(ct_B_names))[:n_show]
+
+    fig, axes = plt.subplots(3, n_show, figsize=(n_show * 3, 9))
+    for k, ct in enumerate(shared):
+        ia = np.where(ct_A_names == ct)[0][0]
+        ib = np.where(ct_B_names == ct)[0][0]
+
+        # Apply stored transform to A image
+        aimg = apply_rotation_stack(imgA[[ia]], transform['angle'])[0]
+        aimg = apply_scale_stack(aimg[None], transform['scale'])[0]
+
+        axes[0, k].imshow(imgA[ia], cmap='hot', origin='lower')
+        axes[0, k].set_title(f'A: {ct[:15]}', fontsize=8)
+        axes[0, k].axis('off')
+
+        axes[1, k].imshow(imgB[ib], cmap='hot', origin='lower')
+        axes[1, k].set_title(f'B: {ct[:15]}', fontsize=8)
+        axes[1, k].axis('off')
+
+        axes[2, k].imshow(aimg, cmap='hot', origin='lower')
+        axes[2, k].set_title('A (registered)', fontsize=8)
+        axes[2, k].axis('off')
+
+    plt.suptitle('Density map channels: A raw | B | A registered', fontsize=10)
+    plt.tight_layout()
+    plt.show()

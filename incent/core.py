@@ -247,16 +247,21 @@ def pairwise_align(
     #   Both span [0, 1.0] → GW thinks A and B are the same size
     #   → forces A cells to spread across all of B → mixing failure.
     #
-    scale = nx.max(D_B)
+    scale = nx.max(nx.max(D_A), nx.max(D_B))
     if float(scale) < 1e-12:
         raise ValueError("D_B is all zeros — check that spatial coordinates exist.")
 
     D_A = D_A / scale   # e.g. spans [0, 0.76] for the provided example data
     D_B = D_B / scale   # spans [0, 1.0]
 
+    # NumPy 2.0 removed ndarray.ptp; use np.ptp for compatibility.
+    span_A = np.ptp(np.asarray(sliceA.obsm['spatial']), axis=0).max()
+    span_B = np.ptp(np.asarray(sliceB.obsm['spatial']), axis=0).max()
+    expected_ratio = span_A / max(span_B, 1e-12)
+
     logFile.write(f"Shared-scale normalization: scale={float(scale):.4f}\n")
     logFile.write(f"D_A max after norm: {float(nx.max(D_A)):.6f}  "
-                  f"(expected ≈ {sliceA.obsm['spatial'].ptp(axis=0).max() / sliceB.obsm['spatial'].ptp(axis=0).max():.4f})\n")
+                  f"(expected ≈ {expected_ratio:.4f})\n")
     logFile.write(f"D_B max after norm: {float(nx.max(D_B)):.6f}  (expected 1.0)\n\n")
 
     if use_gpu and isinstance(nx, ot.backend.TorchBackend):

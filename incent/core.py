@@ -247,7 +247,7 @@ def pairwise_align(
     #   Both span [0, 1.0] → GW thinks A and B are the same size
     #   → forces A cells to spread across all of B → mixing failure.
     #
-    scale = nx.max(nx.max(D_A), nx.max(D_B))
+    scale = max(float(nx.max(D_A)), float(nx.max(D_B)))
     if float(scale) < 1e-12:
         raise ValueError("D_B is all zeros — check that spatial coordinates exist.")
 

@@ -488,6 +488,7 @@ def pairwise_align(
     sliceA_name = kwargs.get('sliceA_name', None)
     sliceB_name = kwargs.get('sliceB_name', None)
     overwrite = bool(kwargs.get('overwrite', False))
+    norm = bool(kwargs.get('norm', False))
     neighborhood_dissimilarity = kwargs.get('neighborhood_dissimilarity', 'jsd')
 
     start_time = time.time()

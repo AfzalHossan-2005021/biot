@@ -232,37 +232,17 @@ def pairwise_align(
     D_A = ot.dist(coordsA, coordsA, metric='euclidean')
     D_B = ot.dist(coordsB, coordsB, metric='euclidean')
 
-    # ── ★ SHARED-SCALE NORMALIZATION (the critical fix) ★ ────────────────────
-    #
-    # Both matrices are divided by the SAME value: max(D_B).
-    # After normalisation:
-    #   D_B spans [0, 1.0]
-    #   D_A spans [0, diameter_A / diameter_B]  ← remains smaller than 1
-    #
-    # This tells GW: "A's internal geometry fits inside B's geometry."
-    # GW will therefore embed A as a spatial subregion of B — which is
-    # exactly what serial-section partial overlap requires.
-    #
-    # Under the OLD independent normalisation (D_A /= max(D_A)):
-    #   Both span [0, 1.0] → GW thinks A and B are the same size
-    #   → forces A cells to spread across all of B → mixing failure.
-    #
-    scale = max(float(nx.max(D_A)), float(nx.max(D_B)))
-    if float(scale) < 1e-12:
-        raise ValueError("D_B is all zeros — check that spatial coordinates exist.")
+    # Normalize each distance matrix by its own minimum non-zero value
+    D_A = D_A / nx.min(D_A > 0)
+    D_B = D_B / nx.min(D_B > 0)
 
-    D_A = D_A / scale   # e.g. spans [0, 0.76] for the provided example data
-    D_B = D_B / scale   # spans [0, 1.0]
+    # Get max for logging
+    scale_A = float(nx.max(D_A))
+    scale_B = float(nx.max(D_B))
 
-    # NumPy 2.0 removed ndarray.ptp; use np.ptp for compatibility.
-    span_A = np.ptp(np.asarray(sliceA.obsm['spatial']), axis=0).max()
-    span_B = np.ptp(np.asarray(sliceB.obsm['spatial']), axis=0).max()
-    expected_ratio = span_A / max(span_B, 1e-12)
-
-    logFile.write(f"Shared-scale normalization: scale={float(scale):.4f}\n")
-    logFile.write(f"D_A max after norm: {float(nx.max(D_A)):.6f}  "
-                  f"(expected ≈ {expected_ratio:.4f})\n")
-    logFile.write(f"D_B max after norm: {float(nx.max(D_B)):.6f}  (expected 1.0)\n\n")
+    logFile.write(f"Normalized by min non-zero: D_A max={scale_A:.6f}, D_B max={scale_B:.6f}\n")
+    logFile.write(f"D_A max after norm: {scale_A:.6f}\n")
+    logFile.write(f"D_B max after norm: {scale_B:.6f}\n\n")
 
     if use_gpu and isinstance(nx, ot.backend.TorchBackend):
         D_A = D_A.cuda()
@@ -327,7 +307,6 @@ def pairwise_align(
                   if use_gpu and isinstance(nx, ot.backend.TorchBackend)
                   else nx.from_numpy(js_dist))
         else:
-            print("Computing JSD matrix")
             js_dist = jensenshannon_divergence_backend(nd_A, nd_B)
             if isinstance(js_dist, torch.Tensor):
                 np.save(jsd_cache, js_dist.cpu().numpy())

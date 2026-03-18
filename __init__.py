@@ -1,1 +1,1 @@
-from .incent import pairwise_align, plot_alignment, plot_density_maps
+from .incent import pairwise_align, visualize_alignment
